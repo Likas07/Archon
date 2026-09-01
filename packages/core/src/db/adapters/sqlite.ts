@@ -740,6 +740,16 @@ export class SqliteAdapter implements IDatabase {
         PRIMARY KEY (workflow_name, node_id, scope_key, provider)
       );
 
+      -- Per-node absolute deadlines persisted across restart and resume
+      CREATE TABLE IF NOT EXISTS remote_agent_workflow_node_deadlines (
+        workflow_run_id TEXT NOT NULL REFERENCES remote_agent_workflow_runs(id) ON DELETE CASCADE,
+        node_key TEXT NOT NULL,
+        started_at TEXT NOT NULL,
+        deadline_at TEXT NOT NULL,
+        expiry_reason TEXT,
+        PRIMARY KEY (workflow_run_id, node_key)
+      );
+
       -- Indexes
       CREATE INDEX IF NOT EXISTS idx_codebase_env_vars_codebase_id ON remote_agent_codebase_env_vars(codebase_id);
       CREATE INDEX IF NOT EXISTS idx_conversations_platform ON remote_agent_conversations(platform_type, platform_conversation_id);
