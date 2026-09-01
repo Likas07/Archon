@@ -46,6 +46,7 @@ export type {
   ChildIsolationResolver,
   ChildIsolationRequest,
   ChildIsolationResult,
+  FullCommitSha,
 } from './child-isolation';
 import {
   classifyError,
@@ -654,6 +655,7 @@ async function runChildWorkflow(
     isolation,
     childIndex,
     itemHash,
+    startCommit,
     resumeFailedChild,
     inputs,
   } = args;
@@ -797,6 +799,7 @@ async function runChildWorkflow(
         nodeId,
         childIndex,
         codebaseId,
+        ...(startCommit !== undefined ? { startCommit } : {}),
       });
       childCwd = childIsolationEnv.cwd;
     } catch (err) {
