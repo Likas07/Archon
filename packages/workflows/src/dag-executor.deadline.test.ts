@@ -367,6 +367,26 @@ const wrapperTestProviderCapabilities: ProviderCapabilities = {
   containerExec: false,
 };
 
+/**
+ * A provider whose iteration completes immediately without emitting the loop's
+ * completion signal, so the loop always proceeds to its `until_bash` check --
+ * which is the subprocess the test is actually watching.
+ */
+function stubLoopProvider(): IAgentProvider {
+  return {
+    // eslint-disable-next-line @typescript-eslint/require-await -- an async generator needs the async modifier
+    sendQuery: async function* () {
+      // Non-empty output that does NOT contain the loop's until signal: an empty
+      // iteration fails the loop outright, which would end the node before the
+      // until_bash check this test exists to reach.
+      yield { type: 'assistant', content: 'iteration output' };
+      yield { type: 'result', sessionId: 'loop-deadline-sess' };
+    },
+    getType: () => 'claude',
+    getCapabilities: () => wrapperTestProviderCapabilities,
+  } satisfies IAgentProvider;
+}
+
 function wrapperPlatform(): IWorkflowPlatform & { sendMessage: ReturnType<typeof mock> } {
   return {
     sendMessage: mock(() => Promise.resolve()),
@@ -833,6 +853,99 @@ describe('workflow wrapper deadlines', () => {
     expect(harness.cancelWorkflowRun).toHaveBeenCalledWith('child-exact');
 
     // Outlive the command's own 5s, then confirm it never got to write.
+    await new Promise(resolve => setTimeout(resolve, 5500));
+    expect(existsSync(marker)).toBe(false);
+  }, 20_000);
+
+  test("a wrapper deadline kills a child loop's until_bash subprocess", async () => {
+    // The bash-node test above passes on a build where this one fails. The run
+    // signal reached the bash and script dispatch sites but not the two loop
+    // dispatch sites, and a loop's `until_bash` is a subprocess of exactly the
+    // same kind -- it runs between iterations, in the checkout, under the same
+    // shell. Killing the row and leaving that shell running is the same defect
+    // wearing a different node type.
+    const { registerBuiltinProviders } = await import('@archon/providers');
+    registerBuiltinProviders();
+    const marker = join(
+      tmpdir(),
+      `archon-loop-deadline-${String(Date.now())}-${String(process.pid)}`
+    );
+    const clock = new FakeWorkflowClock(0);
+    const parentRun: WorkflowRun = { ...workflowRun, metadata: {}, status: 'running' };
+    const harness = createWrapperStoreHarness({ parentRun });
+    const exactChild = childRun('child-loop', 'running');
+    const childHarness = createWrapperStoreHarness({ parentRun: exactChild });
+    const childDeps: WorkflowDeps = {
+      store: childHarness.store,
+      // The loop's AI iteration returns immediately so the test spends its time
+      // in until_bash, which is the subprocess under examination.
+      getAgentProvider: () => stubLoopProvider(),
+      loadConfig: () => Promise.resolve(wrapperConfig),
+    };
+
+    let childStarted: (() => void) | undefined;
+    const childRunning = new Promise<void>(resolve => {
+      childStarted = resolve;
+    });
+
+    const runChildWorkflow = mock(async (_args: RunChildWorkflowArgs) => {
+      harness.setChildren([exactChild]);
+      childStarted?.();
+      await executeDagWorkflow(
+        childDeps,
+        wrapperPlatform(),
+        'conversation',
+        tmpdir(),
+        {
+          name: 'child',
+          nodes: [
+            {
+              id: 'child-loop',
+              loop: {
+                prompt: 'iterate',
+                until: 'NEVER_EMITTED',
+                until_bash: `sleep 5; touch ${marker}`,
+                max_iterations: 2,
+              },
+            },
+          ],
+        },
+        exactChild,
+        'claude',
+        undefined,
+        tmpdir(),
+        tmpdir(),
+        tmpdir(),
+        'main',
+        'docs',
+        wrapperConfig
+      );
+      return {
+        childRunId: exactChild.id,
+        status: 'failed',
+        error: NODE_DEADLINE_EXCEEDED,
+      } satisfies ChildWorkflowOutcome;
+    });
+
+    const execution = executeWrapper({
+      node: workflowNode(100),
+      parentRun,
+      store: harness.store,
+      clock,
+      platform: wrapperPlatform(),
+      runChildWorkflow,
+    });
+
+    await waitForScheduledDeadline(clock);
+    await childRunning;
+    // The AI iteration has to finish and until_bash has to spawn before the
+    // deadline fires; aborting a signal nobody is listening to yet proves nothing.
+    await new Promise(resolve => setTimeout(resolve, 600));
+    clock.advanceBy(100);
+    await execution;
+
+    expect(harness.cancelWorkflowRun).toHaveBeenCalledWith('child-loop');
+
     await new Promise(resolve => setTimeout(resolve, 5500));
     expect(existsSync(marker)).toBe(false);
   }, 20_000);

@@ -1153,6 +1153,54 @@ describe('WorktreeProvider', () => {
       expect(ranUpdate).toBe(false);
     });
 
+    test('refuses a noFetch init when a NESTED submodule is not available locally', async () => {
+      // The update below is recursive, so the check has to be too. Verified
+      // against real git: with an initialized top-level submodule whose own
+      // nested submodule was never checked out, plain `submodule status` reports
+      // a clean tree while `submodule status --recursive` reports the nested one
+      // as uninitialized -- and `update --init --recursive --no-fetch` then
+      // prints "Cloning into ..." and reaches the network.
+      //
+      // This mock answers the two forms differently, so a check that drops
+      // --recursive sees the clean answer and lets the clone happen.
+      const provider2 = new WorktreeProvider(async () => ({
+        baseBranch: 'main',
+        initSubmodules: true,
+      }));
+      makeGitmodulesPresent();
+
+      execSpy.mockImplementation(async (_cmd: string, args: string[]) => {
+        if (args.includes('submodule') && args.includes('status')) {
+          if (!args.includes('--recursive')) {
+            return {
+              stdout: ' f8fad7af8e6d452582653ea2f5b3446771b9c97d vendor (heads/main)\n',
+              stderr: '',
+            };
+          }
+          return {
+            stdout:
+              ' f8fad7af8e6d452582653ea2f5b3446771b9c97d vendor (heads/main)\n' +
+              '-2ae6c5cf90fddc2fe28de1c5c3335766f6be742f vendor/nested\n',
+            stderr: '',
+          };
+        }
+        return { stdout: '', stderr: '' };
+      });
+
+      const initSubmodules = (
+        provider2 as unknown as { initSubmodules(w: string, n: boolean): Promise<void> }
+      ).initSubmodules.bind(provider2);
+
+      await expect(initSubmodules('/workspace/worktree', true)).rejects.toThrow(
+        /would require network access: vendor\/nested/
+      );
+
+      const ranUpdate = execSpy.mock.calls.some((call: unknown[]) =>
+        (call[1] as string[]).includes('update')
+      );
+      expect(ranUpdate).toBe(false);
+    });
+
     test('allows a noFetch init when every submodule is already local', async () => {
       // Guards the refusal above from passing for the wrong reason: if the check
       // rejected unconditionally, exact worktrees could never initialize at all.

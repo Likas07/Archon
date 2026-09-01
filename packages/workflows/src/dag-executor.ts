@@ -7660,7 +7660,11 @@ async function runLayersInner(
                   resolvedLoopModel,
                   resolvedLoopTier,
                   resolvedLoopEffort,
-                  deadlineSignal
+                  // The loop's own `until_bash` is a deterministic subprocess, so it
+                  // needs the run signal for the same reason the bash/script sites do:
+                  // a wrapper deadline that cancels this run must reach the shell it
+                  // started, not just the row that records it.
+                  combineAbortSignals(deadlineSignal, runSubprocessSignal)
                 ),
               initialOutput,
               {
@@ -7739,7 +7743,9 @@ async function runLayersInner(
                   stepNamePrefix,
                   execContext,
                   ctx.runChildWorkflow,
-                  deadlineSignal
+                  // Same reasoning as the loop node above: the group's `until_bash`
+                  // is a subprocess this run owns.
+                  combineAbortSignals(deadlineSignal, runSubprocessSignal)
                 ),
               initialOutput,
               {

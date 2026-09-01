@@ -1243,11 +1243,23 @@ export class WorktreeProvider implements IIsolationProvider {
       // never been checked out. Verified empirically — a fresh clone run with
       // `--init --recursive --no-fetch` prints "Cloning into ..." and succeeds.
       // So the local-availability check has to happen here, before git runs.
+      //
+      // `--recursive` because the update below is recursive. Without it the check
+      // sees only top-level submodules, so a parent that IS initialized but whose
+      // own nested submodule is not passes the guard, and the recursive update
+      // then clones that nested one from its remote — the exact network access
+      // this refusal exists to prevent. An uninitialized top-level still reports
+      // as uninitialized under `--recursive` (git cannot descend into it), so the
+      // shallower case keeps failing the same way.
       let statusOut: string;
       try {
-        const { stdout } = await execFileAsync('git', ['-C', worktreePath, 'submodule', 'status'], {
-          timeout: GIT_OPERATION_TIMEOUT_MS,
-        });
+        const { stdout } = await execFileAsync(
+          'git',
+          ['-C', worktreePath, 'submodule', 'status', '--recursive'],
+          {
+            timeout: GIT_OPERATION_TIMEOUT_MS,
+          }
+        );
         statusOut = stdout;
       } catch (error) {
         const err = error as Error;
