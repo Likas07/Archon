@@ -978,8 +978,19 @@ export async function runNodeRetryLoop<T extends NodeOutput>(
       );
     }
 
-    const outcome = await Promise.race(outcomes);
-    waitCancellation.abort();
+    // `finally`, not a bare statement after the race. `run()` can REJECT --
+    // executeLoopNode and executeLoopGroupNode throw NODE_DEADLINE_EXCEEDED out
+    // of their `until_bash` paths, and pre-execution errors propagate the same
+    // way. On that path the race rejects, so a plain `waitCancellation.abort()`
+    // below it never runs: the deadline timer and the parent-abort listener stay
+    // live for the node's whole remaining budget, holding the event loop open
+    // and firing against a node that already finished.
+    let outcome: NodeRetryOutcome<T>;
+    try {
+      outcome = await Promise.race(outcomes);
+    } finally {
+      waitCancellation.abort();
+    }
     if (outcome.kind === 'deadline') {
       if (deadlineAt === undefined) {
         throw new Error(`Node '${node.id}' reached a deadline without a persisted deadline.`);
@@ -2948,6 +2959,14 @@ async function runSubprocess(
       cwd: options.cwd,
       env: options.env,
     });
+    // The signal reaches the local `docker exec` CLIENT, not the process it
+    // started inside the container: docker does not forward the client's death
+    // as a signal to the in-container process, so that process can outlive the
+    // abort and keep mutating the mounted checkout after the node reports
+    // `deadline_exceeded`. This is not a regression from the deadline work --
+    // `timeout` below has always killed the same client process and nothing
+    // more. Closing it needs the in-container pid, which `docker exec` does not
+    // hand back; that is a container-backend change, not a dispatch-site one.
     return execFileAsync('docker', dockerArgs, {
       timeout: options.timeout,
       signal: options.signal,

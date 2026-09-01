@@ -640,6 +640,35 @@ describe('absolute node deadline schedules', () => {
       expect.objectContaining({ data: expect.objectContaining({ state: 'timed_out' }) })
     );
   });
+
+  test('cancels the deadline wait when the attempt throws instead of returning', async () => {
+    // executeLoopNode and executeLoopGroupNode THROW NODE_DEADLINE_EXCEEDED out
+    // of their until_bash paths rather than returning a failed output, so the
+    // race rejects. The wait must still be cancelled on that path, or the timer
+    // outlives the node it was timing.
+    const clock = new FakeWorkflowClock(0);
+    const deadlineStore = createDeadlineStore();
+
+    await expect(
+      runNodeRetryLoop(
+        loopNode(100),
+        platform,
+        'conversation',
+        workflowRun,
+        noRetries,
+        () => Promise.reject(new Error(NODE_DEADLINE_EXCEEDED)),
+        initialOutput,
+        {
+          store: deadlineStore.store,
+          nodeKey: 'loop',
+          clock,
+          deadlineOutput,
+        }
+      )
+    ).rejects.toThrow(NODE_DEADLINE_EXCEEDED);
+
+    expect(clock.pendingWaitCount()).toBe(0);
+  });
 });
 
 test('a prompt node without timeout does not touch the deadline store or clock', async () => {
