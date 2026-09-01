@@ -531,7 +531,13 @@ export function validateDagStructure(
         !FULL_COMMIT_SHA_PATTERN.test(node.start_commit) &&
         (outputRef === null || outputRef[1] === 'INPUTS')
       ) {
-        return `Node '${node.id}' field 'start_commit' must be a full lowercase 40-hex commit SHA or a single $node.output[.field] reference`;
+        // `$INPUTS.sha` does not match the output-ref pattern at all, and `$INPUTS.output`
+        // matches it with producer `INPUTS`. Both are the same authoring mistake, so name
+        // it explicitly rather than leaving the author to infer it from a shape rule.
+        const inputsHint = node.start_commit.startsWith('$INPUTS.')
+          ? " — '$INPUTS' is not accepted here: an immutable child checkout must be a literal commit or one an upstream node in this DAG produces, never a value the caller injects"
+          : '';
+        return `Node '${node.id}' field 'start_commit' must be a full lowercase 40-hex commit SHA or a single $node.output[.field] reference${inputsHint}`;
       }
       const producerId = outputRef?.[1];
       if (producerId !== undefined && !transitiveDepsOf(node.id).has(producerId)) {

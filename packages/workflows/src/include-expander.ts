@@ -149,9 +149,11 @@ class IncludeExpansionError extends Error {}
  * dag-executor.ts. Included loop-command bodies are validated separately during command
  * materialization, then their compiled prompts pass through this rewrite.
  *
- * applyInputsMacro is a SUPERSET of these node-ref surfaces, not a mirror: it additionally walks
- * systemPrompt and agents fields. Those fields accept include inputs but do not receive
- * node-output substitution at runtime, so they are not node-reference surfaces.
+ * applyInputsMacro overlaps these node-ref surfaces but is neither a subset nor a superset.
+ * It additionally walks systemPrompt and agents fields, which accept include inputs but
+ * receive no node-output substitution at runtime. It deliberately SKIPS `workflow.start_commit`:
+ * an immutable child checkout must be a literal commit or one produced by an upstream node in
+ * the same DAG, never a value a caller injects, so the loader rejects `$INPUTS` there.
  */
 function rewriteNodeOutputRefs(node: DagNode, rename: (id: string) => string): void {
   const code = (text: string): string => applyOutputRefRename(text, rename);
