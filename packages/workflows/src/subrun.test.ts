@@ -1204,6 +1204,153 @@ nodes:
     expect(child?.status).toBe('completed');
     expect(child?.working_path).toBe(childCwd);
     expect(child?.working_path).not.toBe(cwd);
+    // Absence is part of the legacy request shape: no optional start_commit key is sent.
+    expect(calls[0]).not.toHaveProperty('startCommit');
+  });
+
+  it('threads a literal start_commit through the child-isolation request', async () => {
+    await writeWorkflow(
+      'child-start-commit',
+      `
+name: child-start-commit
+description: child receiving a declarative checkout identity
+nodes:
+  - id: work
+    prompt: "do the work"
+`
+    );
+    await writeWorkflow(
+      'parent-start-commit',
+      `
+name: parent-start-commit
+description: parent declaring the child's checkout identity
+nodes:
+  - id: sub
+    workflow: child-start-commit
+    isolation: worktree
+    start_commit: "0123456789abcdef0123456789abcdef01234567"
+`
+    );
+
+    const store = new InMemoryStore();
+    const deps = makeDeps(store);
+    const parent = await discover('parent-start-commit');
+    const { resolver, calls } = makeFakeResolver(join(cwd, 'child-start-commit-worktree'));
+
+    const result = await executeWorkflow(
+      deps,
+      makePlatform(),
+      'conv-plat',
+      cwd,
+      parent,
+      'goal',
+      'conv-db',
+      { resolveChildIsolation: resolver }
+    );
+
+    expect(result.success).toBe(true);
+    expect(calls).toHaveLength(1);
+    expect(calls[0]).toMatchObject({
+      startCommit: '0123456789abcdef0123456789abcdef01234567',
+    });
+  });
+
+  it('resolves an output-ref start_commit before dispatching the isolated child', async () => {
+    await writeWorkflow(
+      'child-output-start-commit',
+      `
+name: child-output-start-commit
+description: child receiving a produced checkout identity
+nodes:
+  - id: work
+    prompt: "do the work"
+`
+    );
+    await writeWorkflow(
+      'parent-output-start-commit',
+      `
+name: parent-output-start-commit
+description: parent deriving the child's checkout identity
+nodes:
+  - id: source
+    bash: "printf '{\\"sha\\":\\"0123456789abcdef0123456789abcdef01234567\\"}'"
+  - id: sub
+    workflow: child-output-start-commit
+    isolation: worktree
+    start_commit: "$source.output.sha"
+    depends_on: [source]
+`
+    );
+
+    const store = new InMemoryStore();
+    const deps = makeDeps(store);
+    const parent = await discover('parent-output-start-commit');
+    const { resolver, calls } = makeFakeResolver(join(cwd, 'child-output-start-commit-worktree'));
+
+    const result = await executeWorkflow(
+      deps,
+      makePlatform(),
+      'conv-plat',
+      cwd,
+      parent,
+      'goal',
+      'conv-db',
+      { resolveChildIsolation: resolver }
+    );
+
+    expect(result.success).toBe(true);
+    expect(calls).toHaveLength(1);
+    expect(calls[0]).toMatchObject({
+      startCommit: '0123456789abcdef0123456789abcdef01234567',
+    });
+  });
+
+  it('rejects a resolved ref before dispatch when the producer emits a branch name', async () => {
+    await writeWorkflow(
+      'child-invalid-start-commit',
+      `
+name: child-invalid-start-commit
+description: child that must not receive a branch ref
+nodes:
+  - id: work
+    prompt: "do the work"
+`
+    );
+    await writeWorkflow(
+      'parent-invalid-start-commit',
+      `
+name: parent-invalid-start-commit
+description: parent with an invalid resolved checkout identity
+nodes:
+  - id: source
+    bash: "printf 'main'"
+  - id: sub
+    workflow: child-invalid-start-commit
+    isolation: worktree
+    start_commit: "$source.output"
+    depends_on: [source]
+`
+    );
+
+    const store = new InMemoryStore();
+    const deps = makeDeps(store);
+    const parent = await discover('parent-invalid-start-commit');
+    const { resolver, calls } = makeFakeResolver(join(cwd, 'should-not-be-used'));
+
+    const result = await executeWorkflow(
+      deps,
+      makePlatform(),
+      'conv-plat',
+      cwd,
+      parent,
+      'goal',
+      'conv-db',
+      { resolveChildIsolation: resolver }
+    );
+
+    expect(result.success).toBe(false);
+    expect(calls).toHaveLength(0);
+    expect([...store.runs.values()].filter(r => r.parent_run_id !== null)).toHaveLength(0);
   });
 
   it("isolation: 'worktree' with NO resolver injected fails the node fast (no shared-checkout fallback)", async () => {

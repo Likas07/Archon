@@ -181,13 +181,14 @@ function rewriteNodeOutputRefs(node: DagNode, rename: (id: string) => string): v
   } else if (isScriptNode(node)) {
     node.script = code(node.script);
   } else if (isWorkflowNode(node)) {
-    // workflow.input, workflow.with values and workflow.fan_out.items are live
+    // workflow.input, workflow.with values, workflow.start_commit and workflow.fan_out.items are live
     // code/expression ref surfaces (data strings), so refs inside an included block's
     // `workflow:` node namespace verbatim.
     if (node.input !== undefined) node.input = code(node.input);
     if (node.with !== undefined) {
       for (const [key, value] of Object.entries(node.with)) node.with[key] = code(value);
     }
+    if (node.start_commit !== undefined) node.start_commit = code(node.start_commit);
     if (node.fan_out !== undefined) node.fan_out.items = code(node.fan_out.items);
   } else if (isCancelNode(node)) {
     node.cancel = code(node.cancel);

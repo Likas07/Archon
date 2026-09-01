@@ -3500,6 +3500,139 @@ nodes:
       expect(wf!.workflow.nodes.some(n => n.id === 'sub')).toBe(true);
     });
 
+    it('loads a literal full lowercase start_commit for an isolated workflow node', async () => {
+      const startCommit = '0123456789abcdef0123456789abcdef01234567';
+      const result = await loadOne(
+        'start-commit-literal',
+        `
+name: start-commit-literal
+description: Declarative child checkout identity
+nodes:
+  - id: sub
+    workflow: child-wf
+    isolation: worktree
+    start_commit: "${startCommit}"
+`
+      );
+
+      const err = result.errors.find(e => e.filename === 'start-commit-literal.yaml');
+      expect(err).toBeUndefined();
+      const node = result.workflows
+        .find(w => w.workflow.name === 'start-commit-literal')
+        ?.workflow.nodes.find(n => n.id === 'sub');
+      expect(node && 'start_commit' in node ? node.start_commit : undefined).toBe(startCommit);
+    });
+
+    it('loads an upstream output reference as a start_commit source', async () => {
+      const result = await loadOne(
+        'start-commit-output-ref',
+        `
+name: start-commit-output-ref
+description: Child checkout identity from a producer
+nodes:
+  - id: source
+    prompt: "resolve the commit"
+  - id: sub
+    workflow: child-wf
+    isolation: worktree
+    start_commit: "$source.output.sha"
+    depends_on: [source]
+`
+      );
+
+      const err = result.errors.find(e => e.filename === 'start-commit-output-ref.yaml');
+      expect(err).toBeUndefined();
+    });
+
+    it('rejects an output reference that is not an upstream dependency', async () => {
+      const result = await loadOne(
+        'start-commit-not-upstream',
+        `
+name: start-commit-not-upstream
+description: The producer must run before the child is spawned
+nodes:
+  - id: source
+    prompt: "resolve the commit"
+  - id: sub
+    workflow: child-wf
+    isolation: worktree
+    start_commit: "$source.output.sha"
+`
+      );
+
+      const err = result.errors.find(e => e.filename === 'start-commit-not-upstream.yaml');
+      expect(err?.error).toContain('start_commit');
+      expect(err?.error).toContain('not an upstream dependency');
+    });
+
+    it('rejects an unresolved output reference source', async () => {
+      const result = await loadOne(
+        'start-commit-unknown-ref',
+        `
+name: start-commit-unknown-ref
+description: Unknown commit producer
+nodes:
+  - id: sub
+    workflow: child-wf
+    isolation: worktree
+    start_commit: "$ghost.output.sha"
+`
+      );
+
+      const err = result.errors.find(e => e.filename === 'start-commit-unknown-ref.yaml');
+      expect(err?.error).toContain('references unknown node');
+      expect(err?.error).toContain('start_commit');
+    });
+
+    it.each([
+      ['short SHA', '0123456789abcdef'],
+      ['uppercase SHA', '0123456789ABCDEF0123456789ABCDEF01234567'],
+      ['branch ref', 'main'],
+      ['git ref', 'refs/heads/main'],
+      ['malformed output reference', '$source.output.sha.extra'],
+      ['embedded output reference', 'prefix-$source.output.sha'],
+    ])('rejects %s as a start_commit source', async (description, value) => {
+      const result = await loadOne(
+        `start-commit-invalid-${description.replaceAll(' ', '-')}`,
+        `
+name: start-commit-invalid-${description.replaceAll(' ', '-')}
+description: Invalid start commit source
+nodes:
+  - id: sub
+    workflow: child-wf
+    isolation: worktree
+    start_commit: "${value}"
+`
+      );
+
+      const err = result.errors.find(
+        e => e.filename === `start-commit-invalid-${description.replaceAll(' ', '-')}.yaml`
+      );
+      expect(err?.error).toContain('start_commit');
+    });
+
+    it.each([
+      ['non-workflow node', 'prompt: "work"'],
+      ['workflow without isolation', 'workflow: child-wf'],
+      ['workflow with inherited isolation', 'workflow: child-wf\n    isolation: inherit'],
+    ])('rejects start_commit on a %s', async (description, mode) => {
+      const name = `start-commit-invalid-combination-${description.replaceAll(' ', '-')}`;
+      const result = await loadOne(
+        name,
+        `
+name: ${name}
+description: Invalid start commit combination
+nodes:
+  - id: sub
+    ${mode}
+    start_commit: "0123456789abcdef0123456789abcdef01234567"
+`
+      );
+
+      const err = result.errors.find(e => e.filename === `${name}.yaml`);
+      expect(err?.error).toContain('start_commit');
+    });
+
     it('catches a workflow.input $output ref to an unknown node', async () => {
       const result = await loadOne(
         'bad-ref',

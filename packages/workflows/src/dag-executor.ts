@@ -87,6 +87,7 @@ import {
 import { buildTruncationMarker } from './utils/output-truncation';
 import { writeNodeArtifact, readNodeArtifacts } from './artifacts-index';
 import { COMPILED_LOOP_COMMAND, type LoopWithCompiledCommand } from './compiled-command';
+import { parseFullCommitSha, type FullCommitSha } from './child-isolation';
 import {
   logNodeStart,
   logNodeComplete,
@@ -395,6 +396,8 @@ export interface RunChildWorkflowArgs {
    * (or undefined) shares the parent's checkout. Threaded from `node.isolation`.
    */
   isolation?: WorkflowNode['isolation'];
+  /** Resolved immutable child checkout start point, present only for worktree children. */
+  startCommit?: FullCommitSha;
   /**
    * Fan-out instance index (#2121 slice 2, PR-C). Set when this child is one of N
    * spawned by a `fan_out:` node; stamped into the child's `metadata.child_index` so
@@ -5427,18 +5430,52 @@ async function executeWorkflowNode(
     );
   }
 
+  // Resolve the immutable child checkout identity at spawn time, after the same normal
+  // variable and node-output substitutions used by the other data surfaces. The loader
+  // restricts the source shape; this runtime check brands the final literal and fails
+  // closed if a producer emitted anything other than a full lowercase object id.
+  let startCommit: FullCommitSha | undefined;
+  if (node.start_commit !== undefined) {
+    const startCommitInputs = resolveRunInputs(parentRun);
+    try {
+      const { prompt: substitutedStartCommit } = substituteWorkflowVariables(
+        node.start_commit,
+        parentRun.id,
+        parentRun.user_message ?? '',
+        ctx.artifactsDir,
+        ctx.baseBranch,
+        ctx.docsDir,
+        ctx.issueContext,
+        undefined,
+        undefined,
+        undefined,
+        { stateDir: ctx.stateDir, inputs: startCommitInputs }
+      );
+      const resolvedStartCommit = substituteNodeOutputRefs(substitutedStartCommit, ctx.nodeOutputs);
+      startCommit = parseFullCommitSha(resolvedStartCommit);
+      if (startCommit === undefined) {
+        return failResult(
+          `Node '${node.id}' start_commit must resolve to a full lowercase 40-hex commit SHA`
+        );
+      }
+    } catch (err) {
+      return failResult(
+        `Node '${node.id}' start_commit could not be resolved: ${(err as Error).message}`
+      );
+    }
+  }
+
   // Dynamic fan-out (slice 2, PR-C): a `fan_out:` node expands into N governed child
   // runs over a data-driven item list, joined into one node outcome. This is a
   // distinct execution path from the slice-1 single-child node below — branch here so
   // the 1:1 pause/resume machinery stays untouched for non-fan-out nodes.
   if (node.fan_out) {
-    return executeFanOutWorkflowNode(node, ctx, node.fan_out, ctx.runChildWorkflow);
+    return executeFanOutWorkflowNode(node, ctx, node.fan_out, ctx.runChildWorkflow, startCommit);
   }
 
   // This run's named inputs (#2470), resolved once — threaded identically into the
   // `input:` string and every `with:` value below.
   const parentInputs = resolveRunInputs(parentRun);
-
   // Resolve the input data string (workflow vars + $node.output refs), exactly as
   // prompt/bash nodes resolve their text surface.
   const rawInput = node.input ?? '';
@@ -5648,6 +5685,7 @@ async function executeWorkflowNode(
     userId: parentRun.user_id ?? undefined,
     codebaseId: parentRun.codebase_id ?? undefined,
     isolation: node.isolation,
+    ...(startCommit !== undefined ? { startCommit } : {}),
     ...(resolvedInputs !== undefined ? { inputs: resolvedInputs } : {}),
   };
 
@@ -5921,7 +5959,8 @@ async function executeFanOutWorkflowNode(
   node: WorkflowNode,
   ctx: RunLayersContext,
   fanOut: FanOutConfig,
-  runChild: RunChildWorkflowFn
+  runChild: RunChildWorkflowFn,
+  startCommit?: FullCommitSha
 ): Promise<NodeExecutionResult> {
   const { deps, platform, conversationId, cwd, workflowRun: parentRun } = ctx;
   const msgContext = { workflowId: parentRun.id, nodeName: node.id };
@@ -6351,6 +6390,7 @@ async function executeFanOutWorkflowNode(
         userId: parentRun.user_id ?? undefined,
         codebaseId: parentRun.codebase_id ?? undefined,
         isolation: node.isolation,
+        ...(startCommit !== undefined ? { startCommit } : {}),
         childIndex: i,
         itemHash: hashFanOutItem(input),
         ...(Object.keys(childInputs).length > 0 ? { inputs: childInputs } : {}),
