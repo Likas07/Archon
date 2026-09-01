@@ -265,6 +265,7 @@ export type CommandNode = z.infer<typeof commandNodeSchema> & {
 
 export const promptNodeSchema = dagNodeBaseSchema.extend({
   prompt: z.string(),
+  timeout: z.number().int().positive().optional(),
 });
 
 /** DAG node with an inline prompt (no command file) */
@@ -328,6 +329,7 @@ export type ScriptNode = z.infer<typeof scriptNodeSchema> & {
  */
 export const loopNodeSchema = dagNodeBaseSchema.extend({
   loop: loopNodeConfigSchema,
+  timeout: z.number().int().positive().optional(),
 });
 
 /** DAG node that runs an AI prompt in a loop until a completion condition is met */
@@ -374,6 +376,7 @@ export const loopGroupNodeConfigSchema: z.ZodType<LoopGroupNodeConfig> = loopCon
  */
 export const loopGroupNodeSchema = dagNodeBaseSchema.extend({
   loop_group: loopGroupNodeConfigSchema,
+  timeout: z.number().int().positive().optional(),
 });
 
 /** DAG node that runs a multi-node sub-DAG in a loop until a completion condition is met */
@@ -563,6 +566,7 @@ export type FanOutConfig = z.infer<typeof fanOutConfigSchema>;
  */
 export const workflowNodeSchema = dagNodeBaseSchema.extend({
   workflow: z.string().min(1, "'workflow' must be a non-empty workflow name"),
+  timeout: z.number().int().positive().optional(),
   input: z.string().optional(),
   // Named inputs passed to the child sub-run as `$INPUTS.<name>` (#2470). Mutually
   // exclusive with `input:`. Same identifier-keyed string-map shape as `include.with`.
@@ -664,7 +668,6 @@ export const INCLUDE_NODE_IGNORED_FIELDS: readonly string[] = [
   'output_type',
   'always_run',
   'idle_timeout',
-  'timeout',
 ];
 
 /**
@@ -718,7 +721,7 @@ export const dagNodeFlatSchema = dagNodeBaseSchema.extend({
   script: z.string().optional(),
   runtime: z.enum(['bun', 'uv']).optional(),
   deps: z.array(z.string().min(1, 'each dep must be a non-empty string')).optional(),
-  // Bash/Script shared
+  // Bash/script command timeout, or prompt/loop/loop-group/workflow absolute deadline.
   timeout: z.number().optional(),
 });
 
@@ -749,7 +752,8 @@ export const KNOWN_DAG_NODE_KEYS: ReadonlySet<string> = new Set(
  * - command name validity (via isValidCommandName)
  * - idle_timeout must be a finite positive number
  * - retry not allowed on loop or loop_group nodes
- * - timeout on bash must be positive
+ * - timeout on prompt/loop/loop_group/workflow must be a positive integer
+ * - timeout on bash/script must be positive
  *
  * Note: provider identity is validated in loader.ts (workflow-level) and
  * dag-executor.ts (node-level). Model strings are passed through to the SDK
@@ -894,6 +898,14 @@ export const dagNodeSchema = dagNodeFlatSchema
         path: ['fan_out'],
       });
     }
+    if (hasWorkflow && data.fan_out !== undefined && data.timeout !== undefined) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message:
+          "'timeout' is not supported on workflow nodes with 'fan_out'; use deadlines inside each child workflow.",
+        path: ['timeout'],
+      });
+    }
     // `first_success` racing is REJECTED, not deferred — the earlier deferral is dead. A
     // winner aborting and cancelling its losers is one child's outcome ending its siblings',
     // which the independence rule forbids, and racing without terminating the losers is not
@@ -986,6 +998,39 @@ export const dagNodeSchema = dagNodeFlatSchema
           path: ['timeout'],
         });
       }
+    }
+
+    // Prompt/loop/loop-group/workflow absolute deadline validations.
+    if (hasPrompt || hasLoop || hasLoopGroup || hasWorkflow) {
+      if (
+        data.timeout !== undefined &&
+        (!Number.isInteger(data.timeout) || data.timeout <= 0 || !isFinite(data.timeout))
+      ) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: "'timeout' must be a positive integer (ms)",
+          path: ['timeout'],
+        });
+      }
+    }
+
+    // Mode-specific governance fields fail fast when they would otherwise be
+    // stripped. Mirrors the existing isolation/fan_out posture above.
+    if (
+      data.timeout !== undefined &&
+      !hasPrompt &&
+      !hasLoop &&
+      !hasLoopGroup &&
+      !hasWorkflow &&
+      !hasBash &&
+      !hasScript
+    ) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message:
+          "'timeout' is only supported on prompt, loop, loop_group, workflow, bash, and script nodes.",
+        path: ['timeout'],
+      });
     }
 
     // Script node validations
@@ -1095,7 +1140,13 @@ export const dagNodeSchema = dagNodeFlatSchema
       return { ...base, ...shared, ...aiOnly, command: data.command.trim() } as CommandNode;
     }
     if (data.prompt !== undefined && data.prompt.trim().length > 0) {
-      return { ...base, ...shared, ...aiOnly, prompt: data.prompt.trim() } as PromptNode;
+      return {
+        ...base,
+        ...shared,
+        ...aiOnly,
+        prompt: data.prompt.trim(),
+        ...(data.timeout !== undefined ? { timeout: data.timeout } : {}),
+      } as PromptNode;
     }
     if (data.bash !== undefined && data.bash.trim().length > 0) {
       return {
@@ -1148,6 +1199,7 @@ export const dagNodeSchema = dagNodeFlatSchema
         ...(data.output_type !== undefined ? { output_type: data.output_type } : {}),
         ...(data.output_format !== undefined ? { output_format: data.output_format } : {}),
         workflow: data.workflow.trim(),
+        ...(data.timeout !== undefined ? { timeout: data.timeout } : {}),
         ...(data.input !== undefined ? { input: data.input } : {}),
         // `with:` supplies named $INPUTS to the child sub-run (#2470), validated in shape
         // by the superRefine above and mutually exclusive with `input:`. Mirrors the
@@ -1169,7 +1221,12 @@ export const dagNodeSchema = dagNodeFlatSchema
     // fields are the ones LOOP_GROUP_NODE_AI_FIELDS declares unsupported: they ride along
     // here but the loader warns about and ignores them at runtime.
     if (data.loop_group !== undefined) {
-      return { ...base, ...aiOnly, loop_group: data.loop_group } as LoopGroupNode;
+      return {
+        ...base,
+        ...aiOnly,
+        loop_group: data.loop_group,
+        ...(data.timeout !== undefined ? { timeout: data.timeout } : {}),
+      } as LoopGroupNode;
     }
     // loop — guaranteed by superRefine to be defined at this point.
     // Unlike the rest of aiOnly (dropped for loops — model/provider inherit from
@@ -1182,6 +1239,7 @@ export const dagNodeSchema = dagNodeFlatSchema
       ...base,
       ...(data.pi !== undefined ? { pi: data.pi } : {}),
       loop: data.loop,
+      ...(data.timeout !== undefined ? { timeout: data.timeout } : {}),
     } as LoopNode;
   })
   .openapi('DagNode');

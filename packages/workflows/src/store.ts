@@ -256,4 +256,34 @@ export interface IWorkflowStore extends IRunTreeStore {
      */
     provider?: string;
   }): Promise<{ deleted: number }>;
+
+  /**
+   * Persist the first-dispatch wall-clock deadline for one node. A duplicate
+   * create is a no-op that returns the existing row, so resume receives the
+   * original start and deadline rather than restarting the timer.
+   */
+  createWorkflowNodeDeadline(params: {
+    workflow_run_id: string;
+    node_key: string;
+    started_at: Date | string;
+    deadline_at: Date | string;
+  }): Promise<{
+    workflow_run_id: string;
+    node_key: string;
+    started_at: Date | string;
+    deadline_at: Date | string;
+    expiry_reason: string | null;
+  }>;
+  getWorkflowNodeDeadline(key: { workflow_run_id: string; node_key: string }): Promise<{
+    workflow_run_id: string;
+    node_key: string;
+    started_at: Date | string;
+    deadline_at: Date | string;
+    expiry_reason: string | null;
+  } | null>;
+  expireWorkflowNodeDeadline(params: {
+    workflow_run_id: string;
+    node_key: string;
+    expiry_reason: string;
+  }): Promise<void>;
 }
