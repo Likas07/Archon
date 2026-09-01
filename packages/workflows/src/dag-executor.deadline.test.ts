@@ -1165,3 +1165,50 @@ describe('governance deadline stops layer dispatch inside a loop_group body', ()
     });
   }, 15_000);
 });
+
+test('an event-persistence failure still returns deadline_exceeded and notifies', async () => {
+  // The failure this guards: an unguarded await on createWorkflowEvent rejects
+  // the whole deadline handler, so runLayers reports the database error instead
+  // of deadline_exceeded — the node is recorded as failing for the wrong reason
+  // and the operator is never told the timeout fired.
+  const clock = new FakeWorkflowClock(101);
+  const deadlineStore = createDeadlineStore({
+    workflow_run_id: workflowRun.id,
+    node_key: 'prompt',
+    started_at: new Date(0),
+    deadline_at: new Date(100),
+    expiry_reason: null,
+  });
+  deadlineStore.store.createWorkflowEvent = mock(() =>
+    Promise.reject(new Error('event store unavailable'))
+  );
+  const notifications: string[] = [];
+  const capturingPlatform: IWorkflowPlatform = {
+    sendMessage: mock((_conversationId: string, message: string) => {
+      notifications.push(message);
+      return Promise.resolve();
+    }),
+    getStreamingMode: () => 'batch',
+    getPlatformType: () => 'test',
+  };
+
+  const output = await runNodeRetryLoop(
+    promptNode(100),
+    capturingPlatform,
+    'conversation',
+    workflowRun,
+    noRetries,
+    () => Promise.resolve({ state: 'completed', output: 'too late' }),
+    initialOutput,
+    {
+      store: deadlineStore.store,
+      nodeKey: 'prompt',
+      clock,
+      deadlineOutput,
+    }
+  );
+
+  expect(output).toEqual(deadlineOutput);
+  expect(notifications).toHaveLength(1);
+  expect(notifications[0]).toContain('exceeded its absolute timeout');
+});

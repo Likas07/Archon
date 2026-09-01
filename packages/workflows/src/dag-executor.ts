@@ -792,18 +792,30 @@ async function emitNodeDeadlineExceeded<T extends NodeOutput>(
     );
   }
 
-  await options.store.createWorkflowEvent({
-    workflow_run_id: workflowRun.id,
-    event_type: 'node_failed',
-    step_name: options.nodeKey,
-    data: {
-      error: NODE_DEADLINE_EXCEEDED,
-      reason: NODE_DEADLINE_EXCEEDED,
-      state: 'timed_out',
-      deadline_at: new Date(deadlineAt).toISOString(),
-      ...expiryDetails.eventData,
-    },
-  });
+  // Guarded like the expiry write above, and like every other createWorkflowEvent
+  // call in this file. An unguarded await here rejects the whole function, so a
+  // transient database failure would surface to runLayers as that database error
+  // instead of deadline_exceeded — the node would be reported as having failed
+  // for the wrong reason, and the operator notification below would never send.
+  try {
+    await options.store.createWorkflowEvent({
+      workflow_run_id: workflowRun.id,
+      event_type: 'node_failed',
+      step_name: options.nodeKey,
+      data: {
+        error: NODE_DEADLINE_EXCEEDED,
+        reason: NODE_DEADLINE_EXCEEDED,
+        state: 'timed_out',
+        deadline_at: new Date(deadlineAt).toISOString(),
+        ...expiryDetails.eventData,
+      },
+    });
+  } catch (error) {
+    getLog().error(
+      { err: error as Error, workflowRunId: workflowRun.id, nodeKey: options.nodeKey },
+      'dag.node_deadline_event_persist_failed'
+    );
+  }
   getWorkflowEventEmitter().emit({
     type: 'node_failed',
     runId: workflowRun.id,

@@ -319,7 +319,11 @@ COMMENT ON TABLE remote_agent_workflow_node_sessions IS
 
 CREATE TABLE IF NOT EXISTS remote_agent_workflow_node_deadlines (
   workflow_run_id UUID NOT NULL REFERENCES remote_agent_workflow_runs(id) ON DELETE CASCADE,
-  node_key VARCHAR(255) NOT NULL,
+  -- TEXT, not VARCHAR(n): a node key is `<loop_group>.<body node>` namespaced,
+  -- and dagNodeBaseSchema puts no length bound on a node id. A narrower column
+  -- fails the INSERT, and a deadline that cannot be persisted is a deadline that
+  -- is never enforced — the node runs unbounded instead of timing out.
+  node_key TEXT NOT NULL,
   started_at TIMESTAMP WITH TIME ZONE NOT NULL,
   deadline_at TIMESTAMP WITH TIME ZONE NOT NULL,
   expiry_reason TEXT,
