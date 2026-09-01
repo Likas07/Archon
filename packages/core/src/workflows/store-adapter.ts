@@ -8,6 +8,7 @@ import type { WorkflowRunStatus } from '@archon/workflows/schemas/workflow-run';
 import type { MergedConfig } from '../config/config-types';
 import * as workflowDb from '../db/workflows';
 import * as workflowEventDb from '../db/workflow-events';
+import * as workflowNodeDeadlineDb from '../db/workflow-node-deadlines';
 import * as workflowNodeSessionDb from '../db/workflow-node-sessions';
 import * as codebaseDb from '../db/codebases';
 import * as envVarDb from '../db/env-vars';
@@ -80,6 +81,9 @@ export function createWorkflowStore(): IWorkflowStore {
     getWorkflowNodeSession: workflowNodeSessionDb.getWorkflowNodeSession,
     upsertWorkflowNodeSession: workflowNodeSessionDb.upsertWorkflowNodeSession,
     deleteWorkflowNodeSessions: workflowNodeSessionDb.deleteWorkflowNodeSessions,
+    createWorkflowNodeDeadline: workflowNodeDeadlineDb.createWorkflowNodeDeadline,
+    getWorkflowNodeDeadline: workflowNodeDeadlineDb.getWorkflowNodeDeadline,
+    expireWorkflowNodeDeadline: workflowNodeDeadlineDb.expireWorkflowNodeDeadline,
   };
 }
 

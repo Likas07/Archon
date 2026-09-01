@@ -287,6 +287,64 @@ describe('dagNodeSchema — empty bash/prompt', () => {
   });
 });
 
+describe('dagNodeSchema — absolute deadline timeout', () => {
+  test.each([
+    { id: 'prompt', prompt: 'do it', timeout: 1 },
+    {
+      id: 'loop',
+      loop: { prompt: 'iterate', until: 'DONE', max_iterations: 2 },
+      timeout: 250,
+    },
+    {
+      id: 'group',
+      loop_group: {
+        until: 'DONE',
+        max_iterations: 2,
+        nodes: [{ id: 'body', prompt: 'iterate' }],
+      },
+      timeout: 500,
+    },
+  ])('admits a positive integer timeout on $id nodes', raw => {
+    const result = dagNodeSchema.safeParse(raw);
+    expect(result.success).toBe(true);
+    if (result.success) expect(result.data.timeout).toBe(raw.timeout);
+  });
+
+  test.each([0, -1, 1.5])('rejects invalid prompt timeout %p', timeout => {
+    const result = dagNodeSchema.safeParse({ id: 'prompt', prompt: 'do it', timeout });
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.issues.some(issue => issue.message.includes('positive integer'))).toBe(
+        true
+      );
+    }
+  });
+
+  test('rejects an infinite prompt timeout', () => {
+    expect(
+      dagNodeSchema.safeParse({
+        id: 'prompt',
+        prompt: 'do it',
+        timeout: Number.POSITIVE_INFINITY,
+      }).success
+    ).toBe(false);
+  });
+
+  test.each([
+    { id: 'command', command: 'build', timeout: 100 },
+    { id: 'approval', approval: { message: 'approve?' }, timeout: 100 },
+    { id: 'workflow', workflow: 'child', timeout: 100 },
+  ])('rejects timeout on unsupported $id nodes', raw => {
+    const result = dagNodeSchema.safeParse(raw);
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.issues.some(issue => issue.message.includes('only supported'))).toBe(
+        true
+      );
+    }
+  });
+});
+
 // ---------------------------------------------------------------------------
 // dagNodeSchema — Claude SDK options
 // ---------------------------------------------------------------------------
@@ -1046,9 +1104,10 @@ describe('INCLUDE_NODE_IGNORED_FIELDS', () => {
     for (const f of BASH_NODE_AI_FIELDS) {
       expect(INCLUDE_NODE_IGNORED_FIELDS).toContain(f);
     }
-    for (const f of ['retry', 'output_type', 'always_run', 'idle_timeout', 'timeout']) {
+    for (const f of ['retry', 'output_type', 'always_run', 'idle_timeout']) {
       expect(INCLUDE_NODE_IGNORED_FIELDS).toContain(f);
     }
+    expect(INCLUDE_NODE_IGNORED_FIELDS).not.toContain('timeout');
     // Structural fields the include node legitimately carries are NOT ignored.
     for (const f of ['id', 'depends_on', 'when', 'trigger_rule', 'include', 'description']) {
       expect(INCLUDE_NODE_IGNORED_FIELDS).not.toContain(f);
