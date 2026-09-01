@@ -1428,6 +1428,215 @@ describe('WorktreeProvider', () => {
         expect(getDefaultRemoteSpy).toHaveBeenCalled();
         expect(env).not.toHaveProperty('startCommit');
       });
+
+      test('rolls back worktree and branch when initSubmodules fails on exact path', async () => {
+        const { resolveFullCommitShaSpy, verifyWorktreeHeadSpy } = installExactGitSpies();
+
+        // Set up mockAccess: worktree slots don't exist, but .gitmodules inside them does
+        mockAccess.mockImplementation(async (path: unknown) => {
+          if (typeof path === 'string') {
+            const worktreeBase = join(
+              TEST_ARCHON_HOME,
+              'workspaces',
+              '_local',
+              'repo',
+              'worktrees',
+              'archon'
+            );
+            // Only throw ENOENT for the worktree slot directory itself when checking if it exists,
+            // but allow checking files inside it (like .gitmodules)
+            if (path === worktreeBase || path.match(/worktrees[/\\]archon[/\\]task-[^/\\]*$/)) {
+              const error = new Error('ENOENT') as NodeJS.ErrnoException;
+              error.code = 'ENOENT';
+              throw error;
+            }
+          }
+          // .gitmodules and other paths exist
+          return undefined;
+        });
+
+        const removeWorktreeSpy = spyOn(git, 'removeWorktree');
+        removeWorktreeSpy.mockResolvedValue(undefined);
+
+        const submoduleError = new Error('submodule update failed');
+        execSpy.mockImplementation(async (_command: string, args: string[]) => {
+          if (Array.isArray(args) && args.includes('submodule') && args.includes('update')) {
+            throw submoduleError;
+          }
+          return { stdout: '', stderr: '' };
+        });
+
+        try {
+          await expect(provider.create(exactRequest('submodule-failure'))).rejects.toThrow(
+            /submodule update failed/
+          );
+
+          // Verify worktree removal was attempted
+          expect(removeWorktreeSpy).toHaveBeenCalledWith(
+            git.toRepoPath('/workspace/repo'),
+            expect.stringContaining('task-submodule-failure')
+          );
+
+          // Verify branch deletion was attempted via git branch -D
+          expect(execSpy).toHaveBeenCalledWith(
+            'git',
+            expect.arrayContaining(['-C', '/workspace/repo', 'branch', '-D']),
+            expect.any(Object)
+          );
+        } finally {
+          resolveFullCommitShaSpy.mockRestore();
+          verifyWorktreeHeadSpy.mockRestore();
+          removeWorktreeSpy.mockRestore();
+        }
+      });
+
+      test('rolls back worktree and branch when verifyWorktreeHead fails on exact path', async () => {
+        const { resolveFullCommitShaSpy, verifyWorktreeHeadSpy } = installExactGitSpies();
+        makeExactWorktreeSlotsAbsent();
+        const removeWorktreeSpy = spyOn(git, 'removeWorktree');
+        removeWorktreeSpy.mockResolvedValue(undefined);
+        const verifyError = new Error('HEAD is not at exact commit');
+        verifyWorktreeHeadSpy.mockRejectedValueOnce(verifyError);
+
+        try {
+          await expect(provider.create(exactRequest('verify-failure'))).rejects.toThrow(
+            'HEAD is not at exact commit'
+          );
+
+          // Verify worktree removal was attempted
+          expect(removeWorktreeSpy).toHaveBeenCalled();
+
+          // Verify branch deletion was attempted
+          expect(execSpy).toHaveBeenCalledWith(
+            'git',
+            expect.arrayContaining(['-C', '/workspace/repo', 'branch', '-D']),
+            expect.any(Object)
+          );
+        } finally {
+          resolveFullCommitShaSpy.mockRestore();
+          verifyWorktreeHeadSpy.mockRestore();
+          removeWorktreeSpy.mockRestore();
+        }
+      });
+
+      test('continues after removal failure and rethrows original error', async () => {
+        const { resolveFullCommitShaSpy, verifyWorktreeHeadSpy } = installExactGitSpies();
+
+        // Set up mockAccess: worktree slots don't exist, but .gitmodules inside them does
+        mockAccess.mockImplementation(async (path: unknown) => {
+          if (typeof path === 'string') {
+            const worktreeBase = join(
+              TEST_ARCHON_HOME,
+              'workspaces',
+              '_local',
+              'repo',
+              'worktrees',
+              'archon'
+            );
+            if (path === worktreeBase || path.match(/worktrees[/\\]archon[/\\]task-[^/\\]*$/)) {
+              const error = new Error('ENOENT') as NodeJS.ErrnoException;
+              error.code = 'ENOENT';
+              throw error;
+            }
+          }
+          return undefined;
+        });
+
+        const removeWorktreeSpy = spyOn(git, 'removeWorktree');
+        const removalError = new Error('permission denied');
+        removeWorktreeSpy.mockRejectedValueOnce(removalError);
+
+        const setupError = new Error('submodule update failed');
+        execSpy.mockImplementation(async (_command: string, args: string[]) => {
+          if (Array.isArray(args) && args.includes('submodule') && args.includes('update')) {
+            throw setupError;
+          }
+          return { stdout: '', stderr: '' };
+        });
+
+        try {
+          // The caller should see the ORIGINAL submodule error, not the removal error
+          await expect(provider.create(exactRequest('removal-failure'))).rejects.toThrow(
+            /submodule update failed/
+          );
+
+          // Verify removal was attempted even though it failed
+          expect(removeWorktreeSpy).toHaveBeenCalled();
+
+          // Verify branch deletion was still attempted
+          expect(execSpy).toHaveBeenCalledWith(
+            'git',
+            expect.arrayContaining(['-C', '/workspace/repo', 'branch', '-D']),
+            expect.any(Object)
+          );
+        } finally {
+          resolveFullCommitShaSpy.mockRestore();
+          verifyWorktreeHeadSpy.mockRestore();
+          removeWorktreeSpy.mockRestore();
+        }
+      });
+
+      test('does not remove worktree or branch on successful exact creation', async () => {
+        const { resolveFullCommitShaSpy, verifyWorktreeHeadSpy } = installExactGitSpies();
+        makeExactWorktreeSlotsAbsent();
+        const removeWorktreeSpy = spyOn(git, 'removeWorktree');
+
+        try {
+          await provider.create(exactRequest('success-case'));
+
+          // Verify worktree was NOT removed
+          expect(removeWorktreeSpy).not.toHaveBeenCalled();
+
+          // Verify branch was NOT deleted (no -D flag in any git call)
+          const deleteBranchCalls = execSpy.mock.calls.filter((call: unknown[]) => {
+            const args = call[1] as string[];
+            return args.includes('branch') && args.includes('-D');
+          });
+          expect(deleteBranchCalls).toHaveLength(0);
+        } finally {
+          resolveFullCommitShaSpy.mockRestore();
+          verifyWorktreeHeadSpy.mockRestore();
+          removeWorktreeSpy.mockRestore();
+        }
+      });
+
+      test('legacy non-exact path does not trigger rollback on submodule failure', async () => {
+        const copyWorktreeFilesSpy = spyOn(worktreeCopy, 'copyWorktreeFiles');
+        copyWorktreeFilesSpy.mockResolvedValue([]);
+        const removeWorktreeSpy = spyOn(git, 'removeWorktree');
+
+        // Set up mockAccess to make .gitmodules exist
+        mockAccess.mockImplementation(async (path: unknown) => {
+          // All paths exist (including .gitmodules), so initSubmodules will proceed
+          return undefined;
+        });
+
+        const submoduleError = new Error('submodule update failed');
+        execSpy.mockImplementation(async (_command: string, args: string[]) => {
+          if (Array.isArray(args) && args.includes('submodule') && args.includes('update')) {
+            throw submoduleError;
+          }
+          return { stdout: '', stderr: '' };
+        });
+
+        try {
+          // baseRequest does NOT have a startCommit, so it uses the legacy path
+          await expect(provider.create(baseRequest)).rejects.toThrow(/submodule update failed/);
+
+          // Verify worktree was NOT removed (legacy path has no rollback)
+          expect(removeWorktreeSpy).not.toHaveBeenCalled();
+
+          // Verify branch was NOT deleted
+          const deleteBranchCalls = execSpy.mock.calls.filter((call: unknown[]) => {
+            const args = call[1] as string[];
+            return args.includes('branch') && args.includes('-D');
+          });
+          expect(deleteBranchCalls).toHaveLength(0);
+        } finally {
+          copyWorktreeFilesSpy.mockRestore();
+          removeWorktreeSpy.mockRestore();
+        }
+      });
     });
 
     // Helper: make .gitmodules "exist" (access resolves) while other paths

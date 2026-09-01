@@ -768,13 +768,49 @@ export class WorktreeProvider implements IIsolationProvider {
 
     if (startCommit !== undefined) {
       await this.createExactWorktree(repoPath, worktreePath, branchName, startCommit);
-      await verifyWorktreeHead(toWorktreePath(worktreePath), startCommit);
 
-      if (request.gitIdentity?.email) {
-        await this.applyGitIdentity(worktreePath, request.gitIdentity);
-      }
-      if (worktreeConfig?.initSubmodules !== false) {
-        await this.initSubmodules(worktreePath, true);
+      try {
+        await verifyWorktreeHead(toWorktreePath(worktreePath), startCommit);
+
+        if (request.gitIdentity?.email) {
+          await this.applyGitIdentity(worktreePath, request.gitIdentity);
+        }
+        if (worktreeConfig?.initSubmodules !== false) {
+          await this.initSubmodules(worktreePath, true);
+        }
+      } catch (setupError) {
+        // Roll back: remove worktree and delete the branch on any failure
+        const err = setupError as Error;
+        getLog().warn(
+          { worktreePath, branchName, error: err.message, errorType: err.constructor.name },
+          'worktree.exact_setup_rolled_back'
+        );
+
+        // Best-effort cleanup: don't let cleanup failures mask the original error
+        try {
+          await removeWorktree(toRepoPath(repoPath), toWorktreePath(worktreePath));
+        } catch (cleanupError) {
+          const cleanupErr = cleanupError as Error;
+          getLog().warn(
+            { worktreePath, error: cleanupErr.message, errorType: cleanupErr.constructor.name },
+            'worktree.exact_setup_removal_failed'
+          );
+        }
+
+        try {
+          await execFileAsync('git', ['-C', repoPath, 'branch', '-D', branchName], {
+            timeout: GIT_OPERATION_TIMEOUT_MS,
+          });
+        } catch (branchError) {
+          const branchErr = branchError as Error;
+          getLog().warn(
+            { branchName, error: branchErr.message, errorType: branchErr.constructor.name },
+            'worktree.exact_setup_branch_delete_failed'
+          );
+        }
+
+        // Rethrow the original error, not the cleanup error
+        throw err;
       }
 
       // Copying ignored files from the canonical checkout would make an exact
