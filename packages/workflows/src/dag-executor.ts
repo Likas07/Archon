@@ -712,6 +712,20 @@ function isDeadlineExceededSignal(signal: AbortSignal | undefined): boolean {
   return signal?.aborted === true && signal.reason === NODE_DEADLINE_EXCEEDED;
 }
 
+/**
+ * A deterministic node whose subprocess was killed by the governance deadline
+ * surfaces as an ABORT_ERR from execFile, which the generic subprocess-failure
+ * formatter would report as an ordinary bash/script error. Reporting a deadline
+ * kill as "the command failed" hides the governance decision from the audit
+ * trail and sends the operator looking for a bug in their script.
+ */
+function isDeadlineAbortFailure(
+  err: { code?: number | string },
+  signal: AbortSignal | undefined
+): boolean {
+  return err.code === 'ABORT_ERR' && isDeadlineExceededSignal(signal);
+}
+
 function waitForAbort(signal: AbortSignal, cancellation: AbortSignal): Promise<boolean> {
   if (signal.aborted) return Promise.resolve(true);
   if (cancellation.aborted) return Promise.resolve(false);
@@ -2549,6 +2563,9 @@ async function executeNodeInternal(
 
     // Only post "completed via idle timeout" when output exists — zero-output timeout falls through to the empty-output guard below.
     if (isDeadlineExceededSignal(governanceDeadlineSignal)) {
+      // Clean up throttle entries
+      lastNodeCancelCheck.delete(`${workflowRun.id}:${node.id}`);
+      lastNodeActivityUpdate.delete(`${workflowRun.id}:${node.id}`);
       return {
         state: 'failed',
         output: nodeOutputText,
@@ -2574,6 +2591,9 @@ async function executeNodeInternal(
     // If cancelled during streaming (not idle timeout), return as failed with cancel reason
     if (nodeAbortController.signal.aborted && !nodeIdleTimedOut) {
       if (isDeadlineExceededSignal(governanceDeadlineSignal)) {
+        // Clean up throttle entries
+        lastNodeCancelCheck.delete(`${workflowRun.id}:${node.id}`);
+        lastNodeActivityUpdate.delete(`${workflowRun.id}:${node.id}`);
         return {
           state: 'failed',
           output: nodeOutputText,
@@ -2886,19 +2906,23 @@ async function runSubprocess(
   execContext: ExecutionContext,
   cmd: string,
   args: string[],
-  options: { cwd: string; timeout: number; env: NodeJS.ProcessEnv }
+  options: { cwd: string; timeout: number; env: NodeJS.ProcessEnv; signal?: AbortSignal }
 ): Promise<{ stdout: string; stderr: string }> {
   if (execContext.kind === 'container') {
     const dockerArgs = buildSubprocessDockerArgs(execContext, cmd, args, {
       cwd: options.cwd,
       env: options.env,
     });
-    return execFileAsync('docker', dockerArgs, { timeout: options.timeout });
+    return execFileAsync('docker', dockerArgs, {
+      timeout: options.timeout,
+      signal: options.signal,
+    });
   }
   return execFileAsync(cmd, args, {
     cwd: options.cwd,
     timeout: options.timeout,
     env: { ...process.env, ...options.env },
+    signal: options.signal,
   });
 }
 
@@ -2971,7 +2995,8 @@ async function executeBashNode(
   envVars?: Record<string, string>,
   stepNamePrefix = '',
   iteration?: number,
-  execContext: ExecutionContext = { kind: 'host' }
+  execContext: ExecutionContext = { kind: 'host' },
+  deadlineSignal?: AbortSignal
 ): Promise<NodeOutput> {
   const nodeStartTime = Date.now();
   const nodeContext: SendMessageContext = { workflowId: workflowRun.id, nodeName: node.id };
@@ -3059,6 +3084,7 @@ async function executeBashNode(
       cwd,
       timeout,
       env: subprocessEnv,
+      signal: deadlineSignal,
     });
 
     // Trim trailing newline from stdout (common shell behavior)
@@ -3117,13 +3143,16 @@ async function executeBashNode(
   } catch (error) {
     const err = error as Error & { killed?: boolean; code?: number | string; stderr?: string };
     const isTimeout = err.killed === true || (err.message ?? '').includes('timed out');
+    const deadlineKilled = isDeadlineAbortFailure(err, deadlineSignal);
     const label = `Bash node '${node.id}'`;
     // Always run the formatter so logs get sanitized fields regardless of which
     // user-facing branch we end up in — the timeout message also contains the
     // full `Command failed: bash -c <body>` line and would otherwise leak.
     const formatted = formatSubprocessFailure(err, label);
     let errorMsg: string;
-    if (isTimeout) {
+    if (deadlineKilled) {
+      errorMsg = NODE_DEADLINE_EXCEEDED;
+    } else if (isTimeout) {
       errorMsg = `${label} timed out after ${String(timeout)}ms`;
     } else if (err.code === 'ENOENT' || err.code === 'ENOTDIR') {
       errorMsg =
@@ -3239,7 +3268,8 @@ async function executeScriptNode(
   // env (never spliced into source — #2115). '' for top-level scripts and non-first
   // iterations (mirrors executeBashNode, which delivers loop input via quoted splice).
   loopUserInput = '',
-  execContext: ExecutionContext = { kind: 'host' }
+  execContext: ExecutionContext = { kind: 'host' },
+  deadlineSignal?: AbortSignal
 ): Promise<NodeOutput> {
   const nodeStartTime = Date.now();
   const nodeContext: SendMessageContext = { workflowId: workflowRun.id, nodeName: node.id };
@@ -3438,6 +3468,7 @@ async function executeScriptNode(
       cwd,
       timeout,
       env: subprocessEnv,
+      signal: deadlineSignal,
     });
 
     // Trim trailing newline from stdout (common shell behavior)
@@ -3484,12 +3515,15 @@ async function executeScriptNode(
     const err = error as Error & { killed?: boolean; code?: number | string; stderr?: string };
     const isTimeout = err.killed === true || (err.message ?? '').includes('timed out');
     const label = `Script node '${node.id}'`;
+    const deadlineKilled = isDeadlineAbortFailure(err, deadlineSignal);
     // Always run the formatter so logs get sanitized fields regardless of which
     // user-facing branch we end up in — the timeout message also contains the
     // full `Command failed: bun -e <body>` line and would otherwise leak.
     const formatted = formatSubprocessFailure(err, label);
     let errorMsg: string;
-    if (isTimeout) {
+    if (deadlineKilled) {
+      errorMsg = NODE_DEADLINE_EXCEEDED;
+    } else if (isTimeout) {
       errorMsg = `${label} timed out after ${String(timeout)}ms`;
     } else if (err.message?.includes('ENOENT')) {
       errorMsg = `${label} failed: '${cmd}' executable not found in PATH`;
@@ -4056,10 +4090,23 @@ async function executeLoopGroupNode(
             EXTERNAL_CONTEXT: issueContext ?? '',
             ISSUE_CONTEXT: issueContext ?? '',
           },
+          signal: governanceDeadlineSignal,
         });
         bashComplete = true;
       } catch (e) {
         const bashErr = e as NodeJS.ErrnoException;
+        // The deadline killed this subprocess. It must be checked FIRST: an aborted
+        // command exits non-zero, and the numeric-exit branch below reads that as
+        // "condition not met yet, keep looping" — which would spin the loop past
+        // its own deadline. Returning the deadline error routes the node through
+        // the same terminal path as every other deadline exit.
+        if (isDeadlineExceededSignal(governanceDeadlineSignal)) {
+          getLog().error(
+            { nodeId: node.id, iteration: i },
+            'loop_group.until_bash_deadline_exceeded'
+          );
+          throw new Error(NODE_DEADLINE_EXCEEDED);
+        }
         // System-level errors (ENOENT/EACCES/ENOTDIR) mean the bash binary itself
         // is unreachable — looping forever on bashComplete=false is wrong. Throw
         // out of the group with a clear actionable error instead (mirrors
@@ -5327,10 +5374,20 @@ async function executeLoopNode(
             EXTERNAL_CONTEXT: issueContext ?? '',
             ISSUE_CONTEXT: issueContext ?? '',
           },
+          signal: governanceDeadlineSignal,
         });
         bashComplete = true; // exit 0 = complete
       } catch (e) {
         const bashErr = e as NodeJS.ErrnoException;
+        // The deadline killed this subprocess. It must be checked FIRST: an aborted
+        // command exits non-zero, and the numeric-exit branch below reads that as
+        // "condition not met yet, keep looping" — which would spin the loop past
+        // its own deadline. Returning the deadline error routes the node through
+        // the same terminal path as every other deadline exit.
+        if (isDeadlineExceededSignal(governanceDeadlineSignal)) {
+          getLog().error({ nodeId: node.id, iteration: i }, 'loop.until_bash_deadline_exceeded');
+          throw new Error(NODE_DEADLINE_EXCEEDED);
+        }
         // System-level errors (ENOENT/EACCES/ENOTDIR) mean the bash binary itself
         // is unreachable — looping forever on bashComplete=false is wrong. Throw
         // out of the loop with a clear actionable error instead.
@@ -7470,7 +7527,8 @@ async function runLayers(ctx: RunLayersContext): Promise<void> {
                   config.envVars,
                   stepNamePrefix,
                   iteration,
-                  execContext
+                  execContext,
+                  ctx.parentDeadlineSignal
                 )
             );
             return { nodeId: node.id, output };
@@ -7722,7 +7780,8 @@ async function runLayers(ctx: RunLayersContext): Promise<void> {
                   stepNamePrefix,
                   iteration,
                   ctx.bodyLoopUserInput ?? '',
-                  execContext
+                  execContext,
+                  ctx.parentDeadlineSignal
                 )
             );
             return { nodeId: node.id, output };

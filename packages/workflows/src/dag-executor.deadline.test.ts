@@ -1,4 +1,8 @@
 import { describe, expect, mock, test } from 'bun:test';
+import { existsSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { execFileAsync } from '@archon/git';
 import { executeDagWorkflow, NODE_DEADLINE_EXCEEDED, runNodeRetryLoop } from './dag-executor';
 import { parseWorkflow } from './loader';
 import type { WorkflowClock, WorkflowClockWaitResult } from './clock';
@@ -1007,4 +1011,45 @@ test('loader-admitted prompt timeout reaches the executor deadline store', async
     started_at: new Date(10),
     deadline_at: new Date(85),
   });
+});
+
+describe('deadline termination of deterministic subprocesses', () => {
+  // These exercise the real execFile path rather than a fake clock. A deadline
+  // that reports a stop without stopping the work is worse than no deadline:
+  // the audit trail then asserts something false. The only way to know the
+  // subprocess actually died is to look for its side effect afterwards.
+  const abortAfter = (ms: number): AbortSignal => {
+    const controller = new AbortController();
+    setTimeout(() => {
+      controller.abort(NODE_DEADLINE_EXCEEDED);
+    }, ms);
+    return controller.signal;
+  };
+
+  test('an aborted subprocess is killed before its side effect runs', async () => {
+    const marker = join(tmpdir(), `archon-deadline-${String(Date.now())}-${String(process.pid)}`);
+    const started = Date.now();
+
+    await expect(
+      execFileAsync('bash', ['-c', `sleep 5; touch ${marker}`], {
+        timeout: 60_000,
+        signal: abortAfter(200),
+      })
+    ).rejects.toMatchObject({ code: 'ABORT_ERR' });
+
+    // Bounded well below the command's own 5s: the kill happened, the timeout did not.
+    expect(Date.now() - started).toBeLessThan(2000);
+
+    // Outlive the command's own duration, then confirm it never got to write.
+    await new Promise(resolve => setTimeout(resolve, 5500));
+    expect(existsSync(marker)).toBe(false);
+  }, 20_000);
+
+  test('an unaborted subprocess still runs to completion', async () => {
+    // Guards the assertion above from passing for the wrong reason: if the
+    // signal plumbing broke such that every subprocess died, the test above
+    // would still be green.
+    const { stdout } = await execFileAsync('bash', ['-c', 'echo alive'], { timeout: 10_000 });
+    expect(stdout.trim()).toBe('alive');
+  }, 15_000);
 });
