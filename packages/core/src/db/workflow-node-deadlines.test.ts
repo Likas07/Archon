@@ -95,4 +95,43 @@ describe('workflow-node-deadlines', () => {
     expect(read?.expiry_reason).toBeNull();
     expect(read && 'expiry_reason' in read).toBe(true);
   });
+
+  test('expiring an already-expired deadline preserves the original expiry_reason', async () => {
+    // Setup: create a deadline and expire it once with a reason
+    await createWorkflowNodeDeadline({
+      ...key,
+      started_at: startedAt,
+      deadline_at: deadlineAt,
+    });
+
+    const originalReason = 'absolute_deadline_exceeded';
+    await expireWorkflowNodeDeadline({ ...key, expiry_reason: originalReason });
+
+    // Verify it was set
+    expect((await getWorkflowNodeDeadline(key))?.expiry_reason).toBe(originalReason);
+
+    // Now try to expire it again with a different reason (as happens on resume)
+    const newReason = 'resumed_deadline_exceeded';
+    await expireWorkflowNodeDeadline({ ...key, expiry_reason: newReason });
+
+    // The original reason should still be there, not overwritten
+    const result = await getWorkflowNodeDeadline(key);
+    expect(result?.expiry_reason).toBe(originalReason);
+    expect(result?.expiry_reason).not.toBe(newReason);
+  });
+
+  test('expiring a missing deadline still throws', async () => {
+    // Don't create the deadline, just try to expire a non-existent one
+    const missingKey = { workflow_run_id: 'run-missing', node_key: 'missing_node' };
+
+    try {
+      await expireWorkflowNodeDeadline({ ...missingKey, expiry_reason: 'test_reason' });
+      throw new Error('Should have thrown for missing deadline');
+    } catch (err: unknown) {
+      // Expected: the error message should indicate the deadline was not found
+      const error = err as Error;
+      expect(error.message).toContain('not found');
+      expect(error.message).toContain(missingKey.workflow_run_id);
+    }
+  });
 });

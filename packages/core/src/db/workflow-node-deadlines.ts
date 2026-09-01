@@ -80,16 +80,26 @@ export async function expireWorkflowNodeDeadline(
   params: WorkflowNodeDeadlineKey & { expiry_reason: string }
 ): Promise<void> {
   try {
+    // Update only if expiry_reason is currently NULL — this is first-wins behavior.
+    // The first expiry records the true reason; later resume attempts preserve it.
     const result = await pool.query(
       `UPDATE remote_agent_workflow_node_deadlines
        SET expiry_reason = $3
-       WHERE workflow_run_id = $1 AND node_key = $2`,
+       WHERE workflow_run_id = $1 AND node_key = $2 AND expiry_reason IS NULL`,
       [params.workflow_run_id, params.node_key, params.expiry_reason]
     );
+
+    // If the update affected no rows, it means either the row doesn't exist at all
+    // (an error) or it already has an expiry_reason set (a no-op on resume). Check which.
     if (result.rowCount === 0) {
-      throw new Error(
-        `Workflow node deadline not found: ${params.workflow_run_id}/${params.node_key}`
-      );
+      const existing = await getWorkflowNodeDeadline(params);
+      if (!existing) {
+        throw new Error(
+          `Workflow node deadline not found: ${params.workflow_run_id}/${params.node_key}`
+        );
+      }
+      // Row exists and expiry_reason is already set — this is a normal resume path
+      // where the node was already expired. No-op, no error.
     }
   } catch (error) {
     getLog().error(

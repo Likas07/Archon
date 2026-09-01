@@ -1053,3 +1053,115 @@ describe('deadline termination of deterministic subprocesses', () => {
     expect(stdout.trim()).toBe('alive');
   }, 15_000);
 });
+
+describe('governance deadline stops layer dispatch inside a loop_group body', () => {
+  // A loop_group body is a sub-DAG, and its layers are dispatched by the same
+  // runLayers that drives the top level. Aborting the governance signal does not
+  // change the run's status, so the between-layer status check cannot see an
+  // expired deadline — only a direct signal check can. Without one, a body whose
+  // deadline fires during an early layer still dispatches every later layer, and
+  // the deadline reports a stop it did not perform.
+  function twoLayerLoopGroupNode(timeout: number): DagNode {
+    return {
+      id: 'group',
+      timeout,
+      loop_group: {
+        until: 'DONE',
+        max_iterations: 2,
+        nodes: [
+          { id: 'first', prompt: 'first-body' },
+          // A bash node, deliberately. An AI body node routes through
+          // runNodeRetryLoop, which returns on the aborted parent signal before
+          // reaching the provider — so a later AI layer looks un-dispatched even
+          // with the layer guard removed, and the test would prove nothing. A
+          // deterministic node without `retry:` skips that loop entirely and
+          // announces itself the moment it is dispatched.
+          //
+          // `all_done`, also deliberately: under the default `all_success` this
+          // node would skip because its upstream FAILED on the deadline.
+          {
+            id: 'second',
+            bash: 'echo second-body',
+            depends_on: ['first'],
+            trigger_rule: 'all_done',
+          },
+        ],
+      },
+    };
+  }
+
+  test('a later body layer is never dispatched once the group deadline has fired', async () => {
+    const { registerBuiltinProviders } = await import('@archon/providers');
+    registerBuiltinProviders();
+    const clock = new FakeWorkflowClock(0);
+    const parentRun: WorkflowRun = { ...workflowRun, metadata: {}, status: 'running' };
+    const harness = createWrapperStoreHarness({ parentRun });
+
+    let resolveFirstStarted: (() => void) | undefined;
+    const firstStarted = new Promise<void>(resolve => {
+      resolveFirstStarted = resolve;
+    });
+    const sendQuery = mock(async function* (
+      _prompt: string,
+      _cwd: string,
+      _resumeSessionId?: string,
+      options?: SendQueryOptions
+    ) {
+      const signal = options?.abortSignal;
+      if (!signal) throw new Error('body node did not receive an abort signal');
+      resolveFirstStarted?.();
+      await new Promise<void>(resolve => {
+        if (signal.aborted) resolve();
+        else signal.addEventListener('abort', () => resolve(), { once: true });
+      });
+    });
+    const provider = {
+      sendQuery,
+      getType: () => 'claude',
+      getCapabilities: () => wrapperTestProviderCapabilities,
+    } satisfies IAgentProvider;
+    const deps: WorkflowDeps = {
+      store: harness.store,
+      getAgentProvider: () => provider,
+      loadConfig: () => Promise.resolve(wrapperConfig),
+      clock,
+    };
+
+    const execution = executeDagWorkflow(
+      deps,
+      wrapperPlatform(),
+      'conversation',
+      '/tmp',
+      { name: 'group-deadline', nodes: [twoLayerLoopGroupNode(100)] },
+      parentRun,
+      'claude',
+      undefined,
+      '/tmp',
+      '/tmp',
+      '/tmp',
+      'main',
+      'docs',
+      wrapperConfig
+    );
+
+    await waitForScheduledDeadline(clock);
+    await firstStarted;
+    clock.advanceBy(100);
+    await execution;
+
+    // The assertion that matters: the SECOND layer's node was never dispatched.
+    // Asserting on the group's failure alone would stay green with the guard
+    // removed — the group already returned deadline_exceeded once the body
+    // finished running every layer.
+    const startedSteps = harness.events
+      .filter(event => event.event_type === 'node_started')
+      .map(event => event.step_name);
+    expect(startedSteps).toContain('group.first');
+    expect(startedSteps).not.toContain('group.second');
+    expect(harness.expireWorkflowNodeDeadline).toHaveBeenCalledWith({
+      workflow_run_id: parentRun.id,
+      node_key: 'group',
+      expiry_reason: NODE_DEADLINE_EXCEEDED,
+    });
+  }, 15_000);
+});

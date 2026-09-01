@@ -7297,6 +7297,15 @@ async function runLayers(ctx: RunLayersContext): Promise<void> {
     const layer = layers[layerIdx];
     const isParallelLayer = layer.length > 1;
 
+    // Check if the governance deadline has fired before dispatching this layer.
+    // An aborted deadline signal does not change the run's status, so the between-layer
+    // status check below does not see it. We must check the signal directly here to stop
+    // layer dispatch early when the deadline is already exceeded.
+    if (isDeadlineExceededSignal(parentDeadlineSignal)) {
+      getLog().info({ layerIdx, totalLayers: layers.length }, 'dag.layer_skipped_deadline');
+      return;
+    }
+
     if (isParallelLayer) {
       ctx.lastSequentialSession = undefined; // reset — parallel nodes can't share sessions
     }
