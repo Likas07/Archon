@@ -32,6 +32,8 @@ export type { Session, SessionMetadata } from './session';
 // WorkflowEvent
 export { workflowEventRowSchema } from './workflow-event';
 export type { WorkflowEventRow } from './workflow-event';
+export { workflowNodeDeadlineRowSchema } from './workflow-node-deadline';
+export type { WorkflowNodeDeadlineRow } from './workflow-node-deadline';
 
 // EnvVar
 export { codebaseEnvVarSchema } from './env-var';
