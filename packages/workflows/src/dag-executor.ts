@@ -541,6 +541,29 @@ function abortInFlightProviderWork(workflowRunId: string): void {
 }
 
 /**
+ * An abort signal for a run's DETERMINISTIC work — bash and script subprocesses.
+ *
+ * Registered in the same per-run registry as provider controllers, so a wrapper
+ * deadline that cancels a governed child run terminates the child's subprocesses
+ * too. Without it a `workflow:` node's deadline marks the child row `cancelled`
+ * while its `bash:` node keeps running to completion — the run is reported over,
+ * and the subprocess goes on mutating the checkout it was given. That is the
+ * failure the deadline exists to prevent, not a cosmetic reporting gap.
+ *
+ * A run's own top-level nodes have no parent deadline to inherit; this signal is
+ * how a deadline reaches ACROSS the run boundary that `parentDeadlineSignal`
+ * (scoped to a loop_group body inside one run) cannot cross.
+ */
+function createRunSubprocessAbortSignal(workflowRunId: string): {
+  signal: AbortSignal;
+  release: () => void;
+} {
+  const controller = new AbortController();
+  const unregister = registerProviderAbortController(workflowRunId, controller);
+  return { signal: controller.signal, release: unregister };
+}
+
+/**
  * Max validate-and-reask attempts for a `best-effort` provider whose structured
  * output fails schema validation (separate from transient-error retries above).
  * Enforced providers don't reask — a validation failure there is a genuine edge
@@ -7273,6 +7296,25 @@ interface RunLayersContext {
  * Shared by the top-level DAG and `executeLoopGroupNode`'s per-iteration body execution.
  */
 async function runLayers(ctx: RunLayersContext): Promise<void> {
+  // Deterministic subprocesses of THIS run, abortable by run id.
+  //
+  // `ctx.parentDeadlineSignal` only reaches a loop_group body inside one run; it
+  // cannot cross a run boundary, so a governed child run's own bash nodes have
+  // no signal at all. Registering here puts them in the same per-run registry a
+  // wrapper deadline already aborts, which is what makes cancelling a child run
+  // actually stop the child's work rather than only relabel its database row.
+  const runSubprocessAbort = createRunSubprocessAbortSignal(ctx.workflowRun.id);
+  try {
+    await runLayersInner(ctx, runSubprocessAbort.signal);
+  } finally {
+    runSubprocessAbort.release();
+  }
+}
+
+async function runLayersInner(
+  ctx: RunLayersContext,
+  runSubprocessSignal: AbortSignal
+): Promise<void> {
   const {
     deps,
     platform,
@@ -7549,7 +7591,7 @@ async function runLayers(ctx: RunLayersContext): Promise<void> {
                   stepNamePrefix,
                   iteration,
                   execContext,
-                  ctx.parentDeadlineSignal
+                  combineAbortSignals(ctx.parentDeadlineSignal, runSubprocessSignal)
                 )
             );
             return { nodeId: node.id, output };
@@ -7802,7 +7844,7 @@ async function runLayers(ctx: RunLayersContext): Promise<void> {
                   iteration,
                   ctx.bodyLoopUserInput ?? '',
                   execContext,
-                  ctx.parentDeadlineSignal
+                  combineAbortSignals(ctx.parentDeadlineSignal, runSubprocessSignal)
                 )
             );
             return { nodeId: node.id, output };

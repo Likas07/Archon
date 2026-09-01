@@ -750,6 +750,93 @@ describe('workflow wrapper deadlines', () => {
     );
   });
 
+  test("a wrapper deadline kills the child's bash subprocess, not just its database row", async () => {
+    // The AI-child test above passes on a build where this one fails, which is
+    // how the gap survived: `abortInFlightProviderWork` reaches PROVIDER abort
+    // controllers, and a bash node registers none. The child run was marked
+    // `cancelled` while its subprocess ran on to completion, still mutating the
+    // checkout it was handed -- the run reported over, the work not over.
+    //
+    // Observed live before the fix: a `sleep 60` under a 3s wrapper deadline ran
+    // the full 60 seconds with the child row already `cancelled`.
+    //
+    // A real subprocess and a real marker file, following the pattern below: the
+    // only way to know a process died is to look for the side effect it would
+    // have had, after the time it would have had it.
+    const { registerBuiltinProviders } = await import('@archon/providers');
+    registerBuiltinProviders();
+    const marker = join(
+      tmpdir(),
+      `archon-wrapper-deadline-${String(Date.now())}-${String(process.pid)}`
+    );
+    const clock = new FakeWorkflowClock(0);
+    const parentRun: WorkflowRun = { ...workflowRun, metadata: {}, status: 'running' };
+    const harness = createWrapperStoreHarness({ parentRun });
+    const exactChild = childRun('child-exact', 'running');
+    const childHarness = createWrapperStoreHarness({ parentRun: exactChild });
+    const childDeps: WorkflowDeps = {
+      store: childHarness.store,
+      getAgentProvider: () => {
+        throw new Error('the child runs a bash node and must never reach a provider');
+      },
+      loadConfig: () => Promise.resolve(wrapperConfig),
+    };
+
+    let childStarted: (() => void) | undefined;
+    const childRunning = new Promise<void>(resolve => {
+      childStarted = resolve;
+    });
+
+    const runChildWorkflow = mock(async (_args: RunChildWorkflowArgs) => {
+      harness.setChildren([exactChild]);
+      childStarted?.();
+      await executeDagWorkflow(
+        childDeps,
+        wrapperPlatform(),
+        'conversation',
+        tmpdir(),
+        { name: 'child', nodes: [{ id: 'child-bash', bash: `sleep 5; touch ${marker}` }] },
+        exactChild,
+        'claude',
+        undefined,
+        tmpdir(),
+        tmpdir(),
+        tmpdir(),
+        'main',
+        'docs',
+        wrapperConfig
+      );
+      return {
+        childRunId: exactChild.id,
+        status: 'failed',
+        error: NODE_DEADLINE_EXCEEDED,
+      } satisfies ChildWorkflowOutcome;
+    });
+
+    const execution = executeWrapper({
+      node: workflowNode(100),
+      parentRun,
+      store: harness.store,
+      clock,
+      platform: wrapperPlatform(),
+      runChildWorkflow,
+    });
+
+    await waitForScheduledDeadline(clock);
+    await childRunning;
+    // Let the subprocess actually spawn before the deadline fires; aborting a
+    // signal nobody is listening to yet would prove nothing.
+    await new Promise(resolve => setTimeout(resolve, 300));
+    clock.advanceBy(100);
+    await execution;
+
+    expect(harness.cancelWorkflowRun).toHaveBeenCalledWith('child-exact');
+
+    // Outlive the command's own 5s, then confirm it never got to write.
+    await new Promise(resolve => setTimeout(resolve, 5500));
+    expect(existsSync(marker)).toBe(false);
+  }, 20_000);
+
   test('a wrapper node without timeout never touches the clock or deadline store', async () => {
     const clock = new FakeWorkflowClock(0);
     const parentRun: WorkflowRun = { ...workflowRun, metadata: {}, status: 'running' };
