@@ -131,4 +131,65 @@ describe('isolation-environments metadata — real SQLite round trip', () => {
       volume: 'archon-merge-upper',
     });
   });
+
+  test('an active child slot cannot replace its immutable start_commit', async () => {
+    const startCommit = 'a'.repeat(40);
+    const replacementCommit = 'b'.repeat(40);
+    const initial = await create({
+      codebase_id: 'cb-1',
+      workflow_type: 'task',
+      workflow_id: 'wf-immutable-start',
+      provider: 'worktree',
+      working_path: '/tmp/child-at-a',
+      branch_name: 'archon/task-immutable' as never,
+      metadata: { start_commit: startCommit, parent_run_id: 'parent-1' },
+    });
+
+    const sameIdentity = await create({
+      codebase_id: 'cb-1',
+      workflow_type: 'task',
+      workflow_id: 'wf-immutable-start',
+      provider: 'worktree',
+      working_path: '/tmp/child-at-a',
+      branch_name: 'archon/task-immutable' as never,
+      metadata: { start_commit: startCommit, parent_run_id: 'parent-1', adopted: true },
+    });
+    expect(sameIdentity.id).toBe(initial.id);
+    expect(sameIdentity.metadata.start_commit).toBe(startCommit);
+
+    await expect(
+      create({
+        codebase_id: 'cb-1',
+        workflow_type: 'task',
+        workflow_id: 'wf-immutable-start',
+        provider: 'worktree',
+        working_path: '/tmp/child-at-b',
+        branch_name: 'archon/task-immutable' as never,
+        metadata: { start_commit: replacementCommit, parent_run_id: 'parent-1' },
+      })
+    ).rejects.toThrow('immutable start_commit');
+
+    const persisted = await getById(initial.id);
+    expect(persisted?.metadata.start_commit).toBe(startCommit);
+  });
+
+  test('metadata merge cannot replace an already-persisted start_commit', async () => {
+    const startCommit = 'c'.repeat(40);
+    const created = await create({
+      codebase_id: 'cb-1',
+      workflow_type: 'task',
+      workflow_id: 'wf-immutable-metadata-merge',
+      provider: 'worktree',
+      working_path: '/tmp/child-at-c',
+      branch_name: 'archon/task-immutable-metadata' as never,
+      metadata: { start_commit: startCommit },
+    });
+
+    await expect(updateMetadata(created.id, { start_commit: 'd'.repeat(40) })).rejects.toThrow(
+      'immutable start_commit'
+    );
+
+    const persisted = await getById(created.id);
+    expect(persisted?.metadata.start_commit).toBe(startCommit);
+  });
 });

@@ -115,6 +115,11 @@ function formatNodeIssue(id: string, issue: z.ZodIssue): string {
  */
 const OUTPUT_REF_SOURCE = String.raw`\$([a-zA-Z_][a-zA-Z0-9_-]*)\.output`;
 
+/** `start_commit` accepts either an exact full lowercase SHA or one exact node-output ref. */
+const FULL_COMMIT_SHA_PATTERN = /^[0-9a-f]{40}$/;
+const START_COMMIT_OUTPUT_REF_PATTERN =
+  /^\$([a-zA-Z_][a-zA-Z0-9_-]*)\.output(?:\.[a-zA-Z_][a-zA-Z0-9_]*)?$/;
+
 /** `when:` also accepts `$nodeId.field` as shorthand for `$nodeId.output.field`. */
 const WHEN_REF_SOURCE = String.raw`\$([a-zA-Z_][a-zA-Z0-9_-]*)\.([a-zA-Z_][a-zA-Z0-9_]*)`;
 
@@ -406,7 +411,7 @@ export function validateDagStructure(
   // Check $nodeId.output references across every public YAML field the executor substitutes at
   // runtime: when:, and the text surfaces that flow through substituteNodeOutputRefs
   // (prompt, bash, script, approval.message/on_reject.prompt, cancel, loop.prompt,
-  // loop.until_bash, loop_group.until_bash, workflow.input/with/fan_out.items). A dangling
+  // loop.until_bash, loop_group.until_bash, workflow.input/with/fan_out.items/start_commit). A dangling
   // ref in any of them can bind the wrong flat-DAG output or fail at run time, so all must
   // be validated here.
   //
@@ -436,6 +441,7 @@ export function validateDagStructure(
     if (isWorkflowNode(node)) {
       if (node.input) sources.push({ field: 'input', text: node.input });
       if (node.fan_out) sources.push({ field: 'fan_out.items', text: node.fan_out.items });
+      if (node.start_commit) sources.push({ field: 'start_commit', text: node.start_commit });
       // A `workflow:` node's `with:` values (#2470) are live ref surfaces: unlike
       // an `include:` node's `with:` (inlined by the macro and caught post-expansion
       // by this same scan), sub-run `with:` values are never inlined — they resolve
@@ -519,6 +525,25 @@ export function validateDagStructure(
     return seen;
   };
   for (const node of nodes) {
+    if (isWorkflowNode(node) && node.start_commit !== undefined) {
+      const outputRef = START_COMMIT_OUTPUT_REF_PATTERN.exec(node.start_commit);
+      if (
+        !FULL_COMMIT_SHA_PATTERN.test(node.start_commit) &&
+        (outputRef === null || outputRef[1] === 'INPUTS')
+      ) {
+        // `$INPUTS.sha` does not match the output-ref pattern at all, and `$INPUTS.output`
+        // matches it with producer `INPUTS`. Both are the same authoring mistake, so name
+        // it explicitly rather than leaving the author to infer it from a shape rule.
+        const inputsHint = node.start_commit.startsWith('$INPUTS.')
+          ? " — '$INPUTS' is not accepted here: an immutable child checkout must be a literal commit or one an upstream node in this DAG produces, never a value the caller injects"
+          : '';
+        return `Node '${node.id}' field 'start_commit' must be a full lowercase 40-hex commit SHA or a single $node.output[.field] reference${inputsHint}`;
+      }
+      const producerId = outputRef?.[1];
+      if (producerId !== undefined && !transitiveDepsOf(node.id).has(producerId)) {
+        return `Node '${node.id}' field 'start_commit' references '$${producerId}.output', which is not an upstream dependency — add '${producerId}' to '${node.id}'.depends_on so the commit is resolved before the child is spawned`;
+      }
+    }
     if (!isWorkflowNode(node) || !node.fan_out) continue;
     const refMatch = new RegExp(OUTPUT_REF_SOURCE).exec(node.fan_out.items);
     const producerId = refMatch?.[1];

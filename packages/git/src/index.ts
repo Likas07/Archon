@@ -2,6 +2,7 @@
 export type {
   RepoPath,
   BranchName,
+  FullCommitSha,
   WorktreePath,
   GitResult,
   GitError,
@@ -10,7 +11,7 @@ export type {
   WorkspaceSyncResult,
   WorktreeInfo,
 } from './types';
-export { toRepoPath, toBranchName, toWorktreePath } from './types';
+export { toRepoPath, toBranchName, toWorktreePath, isFullCommitSha } from './types';
 
 // Process and filesystem wrappers
 export { execFileAsync, mkdirAsync, resolveBashPath } from './exec';
@@ -26,6 +27,7 @@ export {
   removeWorktree,
   getCanonicalRepoPath,
   verifyWorktreeOwnership,
+  verifyWorktreeHead,
 } from './worktree';
 export type { WorktreeLayout, WorktreeBaseOverride } from './worktree';
 
@@ -51,6 +53,7 @@ export type { ForgeType, ForgeInfo } from './forge';
 // Repository operations
 export {
   findRepoRoot,
+  resolveFullCommitSha,
   getDefaultRemote,
   getRemoteUrl,
   listChildRepos,

@@ -554,7 +554,9 @@ export type FanOutConfig = z.infer<typeof fanOutConfigSchema>;
  * substituted) forwarded as the child's user message. `isolation` selects the
  * child's checkout: `'inherit'` (default) shares the parent's checkout; `'worktree'`
  * (slice 2, PR-A) runs the child in its own git worktree via an injected
- * child-isolation resolver — never inferred, including from `fan_out`. `fan_out` (slice 2,
+ * child-isolation resolver — never inferred, including from `fan_out`. `start_commit` is an
+ * immutable full commit identity for that worktree and is valid only with explicit
+ * `isolation: worktree`. `fan_out` (slice 2,
  * PR-C) expands the node into N child runs over a data-driven item list; concurrent
  * children sharing the parent checkout are the author's call to make, declared by
  * `mutates_checkout: false` on the child workflow. `output_format`/`output_type` from the base stay
@@ -568,6 +570,7 @@ export const workflowNodeSchema = dagNodeBaseSchema.extend({
   // exclusive with `input:`. Same identifier-keyed string-map shape as `include.with`.
   with: z.record(z.string(), z.string()).optional(),
   isolation: z.enum(['inherit', 'worktree']).optional(),
+  start_commit: z.string().min(1).optional(),
   fan_out: fanOutConfigSchema.optional(),
 });
 
@@ -674,7 +677,7 @@ export const INCLUDE_NODE_IGNORED_FIELDS: readonly string[] = [
  * this list (unlike bash/include): it stays meaningful so `$<id>.output.field`
  * works against a child that emits JSON. `output_type` (typed sidecar) and the
  * structural graph fields (id / depends_on / when / trigger_rule / description /
- * input / isolation) are likewise meaningful and absent here.
+ * input / isolation / start_commit) are likewise meaningful and absent here.
  */
 export const WORKFLOW_NODE_IGNORED_FIELDS: readonly string[] = BASH_NODE_AI_FIELDS.filter(
   f => f !== 'output_format'
@@ -705,6 +708,10 @@ export const dagNodeFlatSchema = dagNodeBaseSchema.extend({
   // `'worktree'` (slice 2, PR-A) runs the child in its own git worktree via an
   // injected child-isolation resolver.
   isolation: z.enum(['inherit', 'worktree']).optional(),
+  // Immutable child checkout identity. Contextual validation below restricts this to
+  // workflow nodes with explicit worktree isolation; loader validation restricts its
+  // source to a literal full SHA or one output reference.
+  start_commit: z.string().min(1).optional(),
   // Dynamic fan-out (slice 2, PR-C) — expand the workflow node into N child runs
   // over a data-driven item list. Only meaningful on a `workflow:` node (guarded in
   // superRefine).
@@ -882,6 +889,20 @@ export const dagNodeSchema = dagNodeFlatSchema
         code: z.ZodIssueCode.custom,
         message: "'isolation' is only supported on workflow (sub-run) nodes.",
         path: ['isolation'],
+      });
+    }
+    if (!hasWorkflow && data.start_commit !== undefined) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "'start_commit' is only supported on workflow (sub-run) nodes.",
+        path: ['start_commit'],
+      });
+    }
+    if (hasWorkflow && data.start_commit !== undefined && data.isolation !== 'worktree') {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "'start_commit' requires isolation: 'worktree' on workflow nodes.",
+        path: ['start_commit'],
       });
     }
     // Dynamic fan-out (slice 2, PR-C) is meaningful ONLY on a `workflow:` node — it
@@ -1139,7 +1160,8 @@ export const dagNodeSchema = dagNodeFlatSchema
     if (data.workflow !== undefined && data.workflow.trim().length > 0) {
       // A workflow (sub-run) node makes no direct provider call, so it carries only
       // the structural graph fields plus the sub-run surface: the target name, the
-      // input data string, the reserved isolation mode, and the output typing fields
+      // input data string, the reserved isolation mode, the immutable start commit,
+      // and the output typing fields
       // (output_type → typed sidecar; output_format → `$id.output.field` on a JSON
       // child). aiOnly / shared(retry) / exec-only base fields are dropped; the loader
       // warns about them via WORKFLOW_NODE_IGNORED_FIELDS.
@@ -1159,6 +1181,7 @@ export const dagNodeSchema = dagNodeFlatSchema
         // fan-out whose children would collide is caught at spawn time instead
         // (executeFanOutWorkflowNode), where the child's `mutates_checkout` is knowable.
         ...(data.isolation !== undefined ? { isolation: data.isolation } : {}),
+        ...(data.start_commit !== undefined ? { start_commit: data.start_commit } : {}),
         ...(data.fan_out !== undefined ? { fan_out: data.fan_out } : {}),
       } as WorkflowNode;
     }

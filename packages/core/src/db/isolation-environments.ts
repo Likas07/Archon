@@ -1,7 +1,7 @@
 /**
  * Database operations for isolation environments
  */
-import { pool, getDialect } from './connection';
+import { pool, getDatabaseType, getDialect } from './connection';
 import type {
   IsolationEnvironmentRow,
   IsolationWorkflowType,
@@ -42,6 +42,29 @@ function normalizeEnvironmentRow<T extends IsolationEnvironmentRow>(row: T): T {
     }
   }
   return row;
+}
+
+/**
+ * Read the immutable child start identity from an isolation row's JSON metadata.
+ * The expression is deliberately local to this store: `metadata` is otherwise
+ * opaque to callers, while an active child slot must never be retargeted by an
+ * upsert that races with a later invocation.
+ */
+function jsonStartCommit(column: string): string {
+  if (getDatabaseType() === 'postgresql') {
+    const jsonColumn = column.startsWith('$') ? `${column}::jsonb` : column;
+    return `(${jsonColumn})->>'start_commit'`;
+  }
+  return `json_extract(${column}, '$.start_commit')`;
+}
+
+/** Whether a JSON metadata value explicitly carries the immutable key (including null). */
+function hasJsonStartCommit(column: string): string {
+  if (getDatabaseType() === 'postgresql') {
+    const jsonColumn = column.startsWith('$') ? `${column}::jsonb` : column;
+    return `(${jsonColumn}) ? 'start_commit'`;
+  }
+  return `json_type(${column}, '$.start_commit') IS NOT NULL`;
 }
 
 /**
@@ -95,6 +118,10 @@ export async function listByCodebase(
  */
 export async function create(env: CreateEnvironmentParams): Promise<IsolationEnvironmentRow> {
   const dialect = getDialect();
+  const storedStartCommit = jsonStartCommit('remote_agent_isolation_environments.metadata');
+  const incomingStartCommit = jsonStartCommit('EXCLUDED.metadata');
+  const hasStoredStartCommit = hasJsonStartCommit('remote_agent_isolation_environments.metadata');
+  const hasIncomingStartCommit = hasJsonStartCommit('EXCLUDED.metadata');
   // Note: created_by_user_id is intentionally NOT in the DO UPDATE SET — on
   // re-creation (upsert) we preserve the original creator's attribution.
   // The first user to spin up an environment owns it; subsequent reactivations
@@ -109,9 +136,20 @@ export async function create(env: CreateEnvironmentParams): Promise<IsolationEnv
        branch_name = EXCLUDED.branch_name,
        provider = EXCLUDED.provider,
        created_by_platform = EXCLUDED.created_by_platform,
-       metadata = EXCLUDED.metadata,
+       -- Once an exact child slot carries start_commit, keep that key even when
+       -- a legacy/upstream upsert has no identity field. A different incoming SHA
+       -- is rejected by the conflict WHERE clause below instead of retargeting the
+       -- existing worktree record.
+       metadata = CASE
+         WHEN ${hasStoredStartCommit}
+         THEN ${dialect.jsonMerge('remote_agent_isolation_environments.metadata', 9)}
+         ELSE EXCLUDED.metadata
+       END,
        status = 'active',
        created_at = ${dialect.now()}
+     WHERE NOT ${hasStoredStartCommit}
+       OR NOT ${hasIncomingStartCommit}
+       OR ${storedStartCommit} = ${incomingStartCommit}
      RETURNING *`,
     [
       env.codebase_id,
@@ -127,6 +165,12 @@ export async function create(env: CreateEnvironmentParams): Promise<IsolationEnv
   );
 
   if (!result.rows[0]) {
+    if (typeof env.metadata?.start_commit === 'string') {
+      throw new Error(
+        'Cannot replace immutable start_commit for active isolation environment ' +
+          `'${env.workflow_id}'.`
+      );
+    }
     throw new Error('Failed to create isolation environment: INSERT succeeded but no row returned');
   }
 
@@ -159,14 +203,26 @@ export async function updateStatus(id: string, status: 'active' | 'destroyed'): 
  */
 export async function updateMetadata(id: string, metadata: Record<string, unknown>): Promise<void> {
   const dialect = getDialect();
+  const storedStartCommit = jsonStartCommit('metadata');
+  const incomingStartCommit = jsonStartCommit('$1');
+  const hasStoredStartCommit = hasJsonStartCommit('metadata');
+  const hasIncomingStartCommit = hasJsonStartCommit('$1');
   const result = await pool.query(
     `UPDATE remote_agent_isolation_environments
      SET metadata = ${dialect.jsonMerge('metadata', 1)}
-     WHERE id = $2`,
+     WHERE id = $2
+       AND (
+         NOT ${hasStoredStartCommit}
+         OR NOT ${hasIncomingStartCommit}
+         OR ${storedStartCommit} = ${incomingStartCommit}
+       )`,
     [JSON.stringify(metadata), id]
   );
 
   if (result.rowCount === 0) {
+    if (Object.hasOwn(metadata, 'start_commit')) {
+      throw new Error(`Cannot replace immutable start_commit for isolation environment '${id}'.`);
+    }
     throw new Error(
       `Failed to update isolation environment metadata: no environment found with id '${id}'`
     );

@@ -1016,6 +1016,420 @@ describe('WorktreeProvider', () => {
       );
     });
 
+    describe('exact start commits', () => {
+      const exactCommit = '0123456789abcdef0123456789abcdef01234567';
+
+      const exactWorktreePath = (identifier: string): string =>
+        join(
+          TEST_ARCHON_HOME,
+          'workspaces',
+          '_local',
+          'repo',
+          'worktrees',
+          'archon',
+          `task-${identifier}`
+        );
+
+      const makeExactWorktreeSlotsAbsent = (): void => {
+        mockAccess.mockImplementation(async (path: unknown) => {
+          if (
+            typeof path === 'string' &&
+            path.startsWith(
+              join(TEST_ARCHON_HOME, 'workspaces', '_local', 'repo', 'worktrees', 'archon')
+            )
+          ) {
+            const error = new Error('ENOENT') as NodeJS.ErrnoException;
+            error.code = 'ENOENT';
+            throw error;
+          }
+          if (typeof path === 'string' && path.endsWith('.gitmodules')) {
+            const error = new Error('ENOENT') as NodeJS.ErrnoException;
+            error.code = 'ENOENT';
+            throw error;
+          }
+          return undefined;
+        });
+      };
+
+      const exactRequest = (
+        identifier: string
+      ): IsolationRequest & { startCommit: git.FullCommitSha } => ({
+        ...baseRequest,
+        workflowType: 'task',
+        identifier,
+        // Exact mode must ignore this stale/moving branch hint entirely.
+        fromBranch: 'feature/moving-base',
+        startCommit: exactCommit as git.FullCommitSha,
+      });
+
+      const installExactGitSpies = (): {
+        resolveFullCommitShaSpy: Mock<
+          (repoPath: git.RepoPath, value: string) => Promise<git.FullCommitSha>
+        >;
+        verifyWorktreeHeadSpy: Mock<
+          (worktreePath: git.WorktreePath, expected: git.FullCommitSha) => Promise<void>
+        >;
+      } => {
+        const exactGit = git as typeof git & {
+          resolveFullCommitSha: (
+            repoPath: git.RepoPath,
+            value: string
+          ) => Promise<git.FullCommitSha>;
+          verifyWorktreeHead: (
+            worktreePath: git.WorktreePath,
+            expected: git.FullCommitSha
+          ) => Promise<void>;
+        };
+        const resolveFullCommitShaSpy = spyOn(exactGit, 'resolveFullCommitSha');
+        const verifyWorktreeHeadSpy = spyOn(exactGit, 'verifyWorktreeHead');
+        resolveFullCommitShaSpy.mockImplementation(
+          async (_repoPath, value) => value as git.FullCommitSha
+        );
+        verifyWorktreeHeadSpy.mockResolvedValue(undefined);
+        return { resolveFullCommitShaSpy, verifyWorktreeHeadSpy };
+      };
+
+      test('creates from the literal SHA without syncing or copying a dirty parent', async () => {
+        const { resolveFullCommitShaSpy, verifyWorktreeHeadSpy } = installExactGitSpies();
+        const copyWorktreeFilesSpy = spyOn(worktreeCopy, 'copyWorktreeFiles');
+        copyWorktreeFilesSpy.mockResolvedValue([]);
+        makeExactWorktreeSlotsAbsent();
+        // This would fail legacy creation; exact creation must never consult it.
+        syncWorkspaceSpy.mockRejectedValue(new Error('parent has tracked and untracked changes'));
+
+        try {
+          const env = await provider.create(exactRequest('parent-node-child-0'));
+
+          expect(resolveFullCommitShaSpy).toHaveBeenCalledWith('/workspace/repo', exactCommit);
+          expect(syncWorkspaceSpy).not.toHaveBeenCalled();
+          expect(getDefaultRemoteSpy).not.toHaveBeenCalled();
+          expect(copyWorktreeFilesSpy).not.toHaveBeenCalled();
+          expect(env).toHaveProperty('startCommit', exactCommit);
+          expect(verifyWorktreeHeadSpy).toHaveBeenCalledWith(env.workingPath, exactCommit);
+          expect(execSpy).toHaveBeenCalledWith(
+            'git',
+            expect.arrayContaining([
+              '-C',
+              '/workspace/repo',
+              'worktree',
+              'add',
+              '--no-track',
+              expect.any(String),
+              '-b',
+              'archon/task-parent-node-child-0',
+              exactCommit,
+            ]),
+            expect.any(Object)
+          );
+
+          const movingRefCalls = execSpy.mock.calls.filter((call: unknown[]) => {
+            const args = call[1] as string[];
+            return (
+              args.includes('fetch') ||
+              args.includes('reset') ||
+              args.includes('checkout') ||
+              args.includes('-f') ||
+              args.some(arg => arg === 'origin/main' || arg === 'feature/moving-base')
+            );
+          });
+          expect(movingRefCalls).toHaveLength(0);
+        } finally {
+          copyWorktreeFilesSpy.mockRestore();
+          resolveFullCommitShaSpy.mockRestore();
+          verifyWorktreeHeadSpy.mockRestore();
+        }
+      });
+
+      test('adopts the same slot only after proving its exact HEAD', async () => {
+        const { resolveFullCommitShaSpy, verifyWorktreeHeadSpy } = installExactGitSpies();
+        worktreeExistsSpy.mockResolvedValue(true);
+        mockReadFile.mockResolvedValue(
+          'gitdir: /workspace/repo/.git/worktrees/archon/task-parent-node-child-0\n'
+        );
+        listWorktreesSpy.mockResolvedValue([
+          {
+            path: exactWorktreePath('parent-node-child-0'),
+            branch: 'archon/task-parent-node-child-0',
+          },
+        ]);
+
+        try {
+          const env = await provider.create(exactRequest('parent-node-child-0'));
+
+          expect(env.metadata.adopted).toBe(true);
+          expect(env).toHaveProperty('startCommit', exactCommit);
+          expect(resolveFullCommitShaSpy).toHaveBeenCalledWith('/workspace/repo', exactCommit);
+          expect(verifyWorktreeHeadSpy).toHaveBeenCalledWith(env.workingPath, exactCommit);
+          expect(syncWorkspaceSpy).not.toHaveBeenCalled();
+          expect(getDefaultRemoteSpy).not.toHaveBeenCalled();
+          expect(
+            execSpy.mock.calls.filter((call: unknown[]) => (call[1] as string[]).includes('add'))
+          ).toHaveLength(0);
+        } finally {
+          resolveFullCommitShaSpy.mockRestore();
+          verifyWorktreeHeadSpy.mockRestore();
+        }
+      });
+
+      test('rejects a same-SHA detached slot without checking out or reporting the requested branch', async () => {
+        const { resolveFullCommitShaSpy, verifyWorktreeHeadSpy } = installExactGitSpies();
+        worktreeExistsSpy.mockResolvedValue(true);
+        mockReadFile.mockResolvedValue(
+          'gitdir: /workspace/repo/.git/worktrees/archon/task-parent-node-child-0\n'
+        );
+        // `git worktree list --porcelain` omits `branch` for detached slots.
+        listWorktreesSpy.mockResolvedValue([]);
+
+        try {
+          await expect(provider.create(exactRequest('parent-node-child-0'))).rejects.toThrow(
+            /not registered on requested branch/
+          );
+          expect(syncWorkspaceSpy).not.toHaveBeenCalled();
+          expect(
+            execSpy.mock.calls.filter((call: unknown[]) => {
+              const args = call[1] as string[];
+              return args.includes('checkout') || args.includes('reset') || args.includes('-f');
+            })
+          ).toHaveLength(0);
+        } finally {
+          resolveFullCommitShaSpy.mockRestore();
+          verifyWorktreeHeadSpy.mockRestore();
+        }
+      });
+
+      test('rejects a same-SHA slot registered to a different branch without reporting the requested branch', async () => {
+        const { resolveFullCommitShaSpy, verifyWorktreeHeadSpy } = installExactGitSpies();
+        worktreeExistsSpy.mockResolvedValue(true);
+        mockReadFile.mockResolvedValue(
+          'gitdir: /workspace/repo/.git/worktrees/archon/task-parent-node-child-0\n'
+        );
+        listWorktreesSpy.mockResolvedValue([
+          {
+            path: exactWorktreePath('parent-node-child-0'),
+            branch: 'archon/task-different-child',
+          },
+        ]);
+
+        try {
+          await expect(provider.create(exactRequest('parent-node-child-0'))).rejects.toThrow(
+            /registered to branch archon\/task-different-child, expected archon\/task-parent-node-child-0/
+          );
+          expect(syncWorkspaceSpy).not.toHaveBeenCalled();
+          expect(
+            execSpy.mock.calls.filter((call: unknown[]) => {
+              const args = call[1] as string[];
+              return args.includes('checkout') || args.includes('reset') || args.includes('-f');
+            })
+          ).toHaveLength(0);
+        } finally {
+          resolveFullCommitShaSpy.mockRestore();
+          verifyWorktreeHeadSpy.mockRestore();
+        }
+      });
+
+      test('rejects a same-SHA slot absent from the repository worktree registry', async () => {
+        const { resolveFullCommitShaSpy, verifyWorktreeHeadSpy } = installExactGitSpies();
+        worktreeExistsSpy.mockResolvedValue(true);
+        mockReadFile.mockResolvedValue(
+          'gitdir: /workspace/repo/.git/worktrees/archon/task-parent-node-child-0\n'
+        );
+        listWorktreesSpy.mockResolvedValue([
+          { path: '/workspace/repo', branch: 'main' },
+          { path: exactWorktreePath('other-child'), branch: 'archon/task-other-child' },
+        ]);
+
+        try {
+          await expect(provider.create(exactRequest('parent-node-child-0'))).rejects.toThrow(
+            /not registered on requested branch/
+          );
+          expect(
+            execSpy.mock.calls.filter((call: unknown[]) => (call[1] as string[]).includes('add'))
+          ).toHaveLength(0);
+        } finally {
+          resolveFullCommitShaSpy.mockRestore();
+          verifyWorktreeHeadSpy.mockRestore();
+        }
+      });
+
+      test('rejects a same-slot worktree with a different SHA without resetting it', async () => {
+        const { resolveFullCommitShaSpy, verifyWorktreeHeadSpy } = installExactGitSpies();
+        worktreeExistsSpy.mockResolvedValue(true);
+        mockReadFile.mockResolvedValue(
+          'gitdir: /workspace/repo/.git/worktrees/archon/task-parent-node-child-0\n'
+        );
+        listWorktreesSpy.mockResolvedValue([
+          {
+            path: exactWorktreePath('parent-node-child-0'),
+            branch: 'archon/task-parent-node-child-0',
+          },
+        ]);
+        verifyWorktreeHeadSpy.mockRejectedValue(
+          new Error(`Worktree HEAD differs from expected exact commit ${exactCommit}`)
+        );
+
+        try {
+          await expect(provider.create(exactRequest('parent-node-child-0'))).rejects.toThrow(
+            'differs from expected exact commit'
+          );
+          expect(syncWorkspaceSpy).not.toHaveBeenCalled();
+          expect(
+            execSpy.mock.calls.filter((call: unknown[]) => {
+              const args = call[1] as string[];
+              return args.includes('reset') || args.includes('checkout') || args.includes('-f');
+            })
+          ).toHaveLength(0);
+        } finally {
+          resolveFullCommitShaSpy.mockRestore();
+          verifyWorktreeHeadSpy.mockRestore();
+        }
+      });
+
+      test('rejects an occupied repo-local exact slot without removing its contents', async () => {
+        const { resolveFullCommitShaSpy, verifyWorktreeHeadSpy } = installExactGitSpies();
+        const worktreePath = join(
+          '/workspace/repo',
+          '.archon',
+          'worktrees',
+          'archon',
+          'task-populated-slot'
+        );
+        const slotContents = ['must-survive-exact-create'];
+        const repoLocalProvider = new WorktreeProvider(async () => ({
+          baseBranch: 'main',
+          path: '.archon/worktrees',
+        }));
+        const enoentError = (): NodeJS.ErrnoException => {
+          const error = new Error('ENOENT') as NodeJS.ErrnoException;
+          error.code = 'ENOENT';
+          return error;
+        };
+
+        mockAccess.mockImplementation(async (path: unknown) => {
+          if (path === worktreePath) return undefined;
+          if (typeof path === 'string' && path.endsWith('.gitmodules')) {
+            throw enoentError();
+          }
+          return undefined;
+        });
+        mockRm.mockImplementation(async (path?: unknown) => {
+          if (path === worktreePath) {
+            slotContents.splice(0);
+          }
+        });
+
+        try {
+          await expect(repoLocalProvider.create(exactRequest('populated-slot'))).rejects.toThrow(
+            /refusing to remove/
+          );
+          expect(mockRm).not.toHaveBeenCalled();
+          expect(slotContents).toEqual(['must-survive-exact-create']);
+          expect(
+            execSpy.mock.calls.filter((call: unknown[]) => (call[1] as string[]).includes('add'))
+          ).toHaveLength(0);
+        } finally {
+          resolveFullCommitShaSpy.mockRestore();
+          verifyWorktreeHeadSpy.mockRestore();
+        }
+      });
+
+      test('keeps parallel child identities and worktree paths distinct at one SHA', async () => {
+        const { resolveFullCommitShaSpy, verifyWorktreeHeadSpy } = installExactGitSpies();
+        makeExactWorktreeSlotsAbsent();
+
+        try {
+          const first = await provider.create(exactRequest('parent-node-child-0'));
+          const second = await provider.create(exactRequest('parent-node-child-1'));
+
+          expect(first.branchName).not.toBe(second.branchName);
+          expect(first.workingPath).not.toBe(second.workingPath);
+          expect(first).toHaveProperty('startCommit', exactCommit);
+          expect(second).toHaveProperty('startCommit', exactCommit);
+          expect(resolveFullCommitShaSpy).toHaveBeenCalledTimes(2);
+          expect(verifyWorktreeHeadSpy).toHaveBeenCalledTimes(2);
+        } finally {
+          resolveFullCommitShaSpy.mockRestore();
+          verifyWorktreeHeadSpy.mockRestore();
+        }
+      });
+
+      test('fails a pruned slot with a stale branch instead of force-resetting it', async () => {
+        const { resolveFullCommitShaSpy, verifyWorktreeHeadSpy } = installExactGitSpies();
+        makeExactWorktreeSlotsAbsent();
+        const branchExists = Object.assign(new Error('fatal: branch already exists'), {
+          stderr: 'fatal: a branch named archon/task-parent-node-child-0 already exists',
+        });
+        execSpy.mockImplementation(async (_command: string, args: string[]) => {
+          if (args.includes('worktree') && args.includes('add') && args.includes('-b')) {
+            throw branchExists;
+          }
+          return { stdout: '', stderr: '' };
+        });
+
+        try {
+          await expect(provider.create(exactRequest('parent-node-child-0'))).rejects.toThrow(
+            'branch already exists'
+          );
+          expect(syncWorkspaceSpy).not.toHaveBeenCalled();
+          expect(
+            execSpy.mock.calls.filter((call: unknown[]) => (call[1] as string[]).includes('-f'))
+          ).toHaveLength(0);
+        } finally {
+          resolveFullCommitShaSpy.mockRestore();
+          verifyWorktreeHeadSpy.mockRestore();
+        }
+      });
+
+      test('fails exact creation without fetching when the pinned submodule object is unavailable locally', async () => {
+        const { resolveFullCommitShaSpy, verifyWorktreeHeadSpy } = installExactGitSpies();
+        const worktreePath = exactWorktreePath('submodule-object');
+        const enoentError = (): NodeJS.ErrnoException => {
+          const error = new Error('ENOENT') as NodeJS.ErrnoException;
+          error.code = 'ENOENT';
+          return error;
+        };
+        mockAccess.mockImplementation(async (path: unknown) => {
+          if (path === worktreePath) throw enoentError();
+          if (path === join(worktreePath, '.gitmodules')) return undefined;
+          return undefined;
+        });
+        execSpy.mockImplementation(async (_command: string, args: string[]) => {
+          if (args.includes('submodule') && args.includes('update')) {
+            throw Object.assign(new Error('pinned submodule object is unavailable locally'), {
+              stderr: `fatal: reference is not a tree: ${exactCommit}`,
+            });
+          }
+          return { stdout: '', stderr: '' };
+        });
+
+        try {
+          await expect(provider.create(exactRequest('submodule-object'))).rejects.toThrow(
+            /Submodule initialization failed: fatal: reference is not a tree/
+          );
+          const submoduleArgs = execSpy.mock.calls.find((call: unknown[]) => {
+            const args = call[1] as string[];
+            return args.includes('submodule') && args.includes('update');
+          })?.[1] as string[] | undefined;
+          expect(submoduleArgs).toEqual(
+            expect.arrayContaining(['submodule', 'update', '--init', '--recursive', '--no-fetch'])
+          );
+          expect(
+            execSpy.mock.calls.filter((call: unknown[]) => (call[1] as string[]).includes('fetch'))
+          ).toHaveLength(0);
+        } finally {
+          resolveFullCommitShaSpy.mockRestore();
+          verifyWorktreeHeadSpy.mockRestore();
+        }
+      });
+
+      test('keeps legacy branch synchronization unchanged when startCommit is absent', async () => {
+        const env = await provider.create(baseRequest);
+
+        expect(syncWorkspaceSpy).toHaveBeenCalled();
+        expect(getDefaultRemoteSpy).toHaveBeenCalled();
+        expect(env).not.toHaveProperty('startCommit');
+      });
+    });
+
     // Helper: make .gitmodules "exist" (access resolves) while other paths
     // retain the default behavior set in beforeEach.
     const makeGitmodulesPresent = (): void => {
@@ -1051,6 +1465,7 @@ describe('WorktreeProvider', () => {
           '--recursive',
         ])
       );
+      expect(getSubmoduleCallArgs()).not.toContain('--no-fetch');
     });
 
     test('initializes submodules when explicitly opted in and .gitmodules exists', async () => {

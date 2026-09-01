@@ -159,12 +159,18 @@ export type WorkflowRun = z.infer<typeof workflowRunSchema>;
  * `inputs`         — the resolved `with:` map (name → string) the parent supplied (#2470),
  *                    persisted at spawn so the child's `$INPUTS.<name>` reconstitutes on a
  *                    cold resume without re-resolving parent refs that may be out of scope.
+ * `start_commit`   — immutable exact checkout identity for a branded isolated child. It is
+ *                    written at spawn and drives fail-closed verification on parent resume.
+ * `isolation_env_id` / `branch_name` — durable correlation to the child worktree record.
  */
 export const SUBRUN_METADATA_KEYS = {
   parentNodeId: 'parent_node_id',
   childIndex: 'child_index',
   fanOutItemHash: 'fan_out_item_hash',
   inputs: 'inputs',
+  startCommit: 'start_commit',
+  isolationEnvId: 'isolation_env_id',
+  branchName: 'branch_name',
 } as const;
 
 /** Typed view of the sub-run keys on a run's metadata; each is undefined when unset. */
@@ -173,11 +179,17 @@ export function readSubrunMetadata(metadata: Record<string, unknown> | undefined
   childIndex: number | undefined;
   fanOutItemHash: string | undefined;
   inputs: Record<string, string> | undefined;
+  startCommit: string | undefined;
+  isolationEnvId: string | undefined;
+  branchName: string | undefined;
 } {
   const parentNodeId = metadata?.[SUBRUN_METADATA_KEYS.parentNodeId];
   const childIndex = metadata?.[SUBRUN_METADATA_KEYS.childIndex];
   const fanOutItemHash = metadata?.[SUBRUN_METADATA_KEYS.fanOutItemHash];
   const rawInputs = metadata?.[SUBRUN_METADATA_KEYS.inputs];
+  const startCommit = metadata?.[SUBRUN_METADATA_KEYS.startCommit];
+  const isolationEnvId = metadata?.[SUBRUN_METADATA_KEYS.isolationEnvId];
+  const branchName = metadata?.[SUBRUN_METADATA_KEYS.branchName];
   // Accept only a plain object of string values; anything else reads as unset. The
   // writer always stores a Record<string,string>, so a non-conforming value is
   // corrupt/foreign metadata, not a shape this reader should try to coerce.
@@ -195,6 +207,9 @@ export function readSubrunMetadata(metadata: Record<string, unknown> | undefined
     childIndex: typeof childIndex === 'number' ? childIndex : undefined,
     fanOutItemHash: typeof fanOutItemHash === 'string' ? fanOutItemHash : undefined,
     inputs,
+    startCommit: typeof startCommit === 'string' ? startCommit : undefined,
+    isolationEnvId: typeof isolationEnvId === 'string' ? isolationEnvId : undefined,
+    branchName: typeof branchName === 'string' ? branchName : undefined,
   };
 }
 

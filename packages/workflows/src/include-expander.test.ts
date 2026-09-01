@@ -173,6 +173,26 @@ describe('expandWorkflowIncludes — with input mapping', () => {
     );
   });
 
+  test('refuses a caller-injected start_commit and says why', () => {
+    const block = wf('parameterized', [
+      {
+        id: 'child',
+        workflow: 'downstream',
+        isolation: 'worktree',
+        start_commit: '$INPUTS.sha',
+      },
+    ]);
+    const parent = wf('parent', [
+      { id: 'run', include: 'parameterized', with: { sha: 'a'.repeat(40) } },
+    ]);
+
+    const { workflows, errors } = expandWorkflowIncludes(mapOf(block, parent));
+    expect(workflows.has('parent')).toBe(false);
+    const message = errors.find(error => error.filename === 'parent')?.error;
+    expect(message).toContain("Node 'child' field 'start_commit'");
+    expect(message).toContain("'$INPUTS' is not accepted here");
+  });
+
   test('rejects an injected dangling output ref during flattened validation', () => {
     const block = wf('parameterized', [{ id: 'judge', prompt: 'Plan: $INPUTS.plan' }]);
     const parent = wf('parent', [

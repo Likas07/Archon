@@ -28,6 +28,7 @@ import {
   classifyIsolationError,
 } from '@archon/isolation';
 import * as git from '@archon/git';
+import type { FullCommitSha as GitFullCommitSha } from '@archon/git';
 import { createLogger } from '@archon/paths';
 import { loadRepoConfig } from '../config/config-loader';
 import * as isolationDb from '../db/isolation-environments';
@@ -179,6 +180,90 @@ export function createChildWorktreeResolver(
       const identifier = buildChildIdentifier(req.parentRun.id, req.nodeId, childIndex);
 
       try {
+        if (req.mode === 'verify_existing') {
+          if (req.startCommit === undefined) {
+            throw new Error(
+              `Cannot verify child worktree '${identifier}': no immutable start_commit was supplied.`
+            );
+          }
+
+          const persisted = await isolationDb.findActiveByWorkflow(
+            config.codebaseId,
+            'task',
+            identifier
+          );
+          if (!persisted) {
+            throw new Error(
+              `Cannot verify child worktree '${identifier}': its active isolation metadata is missing.`
+            );
+          }
+
+          const persistedStartCommit = persisted.metadata.start_commit;
+          if (typeof persistedStartCommit !== 'string') {
+            throw new Error(
+              `Cannot verify child worktree '${identifier}': its isolation metadata has no immutable start_commit.`
+            );
+          }
+          if (persistedStartCommit !== req.startCommit) {
+            throw new Error(
+              `Cannot verify child worktree '${identifier}': persisted start_commit ${persistedStartCommit} ` +
+                `does not match requested ${req.startCommit}.`
+            );
+          }
+          if (
+            persisted.metadata.parent_run_id !== req.parentRun.id ||
+            persisted.metadata.child_index !== childIndex
+          ) {
+            throw new Error(
+              `Cannot verify child worktree '${identifier}': its isolation metadata belongs to a different child slot.`
+            );
+          }
+          if (!persisted.working_path) {
+            throw new Error(
+              `Cannot verify child worktree '${identifier}': its persisted worktree path is missing.`
+            );
+          }
+
+          const canonicalRepoPath = git.toRepoPath(config.canonicalRepoPath);
+          const worktreePath = git.toWorktreePath(persisted.working_path);
+          if (!(await git.worktreeExists(worktreePath))) {
+            throw new Error(
+              `Cannot verify child worktree '${identifier}': its persisted worktree is missing at ` +
+                `${persisted.working_path}.`
+            );
+          }
+          await git.verifyWorktreeOwnership(worktreePath, canonicalRepoPath);
+          const registered = await git.listWorktrees(canonicalRepoPath);
+          const registeredSlot = registered.find(worktree => worktree.path === worktreePath);
+          if (registeredSlot?.branch !== persisted.branch_name) {
+            throw new Error(
+              `Cannot verify child worktree '${identifier}': its persisted path/branch is not registered ` +
+                'by the canonical repository.'
+            );
+          }
+          await git.verifyWorktreeHead(
+            worktreePath,
+            req.startCommit as unknown as GitFullCommitSha
+          );
+          getLog().info(
+            {
+              parentRunId: req.parentRun.id,
+              nodeId: req.nodeId,
+              childIndex,
+              branch: persisted.branch_name,
+              envId: persisted.id,
+              startCommit: req.startCommit,
+            },
+            'workflow.child_worktree_verified_existing'
+          );
+          return {
+            cwd: persisted.working_path,
+            envId: persisted.id,
+            branchName: persisted.branch_name,
+            startCommit: req.startCommit,
+          };
+        }
+
         const provider = getIsolationProvider();
         const isolatedEnv = await provider.create({
           workflowType: 'task',
@@ -188,7 +273,19 @@ export function createChildWorktreeResolver(
           codebaseName: config.codebaseName,
           canonicalRepoPath: git.toRepoPath(config.canonicalRepoPath),
           description: `sub-run child ${String(childIndex)} (node ${req.nodeId})`,
+          ...(req.startCommit !== undefined
+            ? { startCommit: req.startCommit as unknown as GitFullCommitSha }
+            : {}),
         });
+
+        if (
+          req.startCommit !== undefined &&
+          isolatedEnv.startCommit !== (req.startCommit as unknown as GitFullCommitSha)
+        ) {
+          throw new Error(
+            `Child worktree for '${req.nodeId}' did not verify requested exact commit ${req.startCommit}.`
+          );
+        }
 
         // Register the env so `isolation list`/`cleanup`/`complete <branch>` see it.
         const envRecord = await isolationDb.create({
@@ -208,6 +305,7 @@ export function createChildWorktreeResolver(
             parent_run_id: req.parentRun.id,
             child_index: childIndex,
             adopted: isolatedEnv.metadata.adopted,
+            ...(req.startCommit !== undefined ? { start_commit: req.startCommit } : {}),
           },
         });
 
@@ -264,6 +362,7 @@ export function createChildWorktreeResolver(
           cwd: isolatedEnv.workingPath,
           envId: envRecord.id,
           branchName: isolatedEnv.branchName,
+          ...(req.startCommit !== undefined ? { startCommit: req.startCommit } : {}),
         };
       } catch (err) {
         const error = err as Error;

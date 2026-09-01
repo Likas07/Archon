@@ -337,7 +337,10 @@ function makePlatform(): IWorkflowPlatform {
  * executeWorkflow (artifacts/logs) has a real directory — a real worktree IS a
  * real checkout.
  */
-function makeFakeResolver(childCwd: string): {
+function makeFakeResolver(
+  childCwd: string,
+  sourceCwd?: string
+): {
   resolver: ChildIsolationResolver;
   calls: ChildIsolationRequest[];
 } {
@@ -346,10 +349,14 @@ function makeFakeResolver(childCwd: string): {
     async resolve(req: ChildIsolationRequest): Promise<ChildIsolationResult> {
       calls.push(req);
       await mkdir(childCwd, { recursive: true });
+      if (sourceCwd !== undefined) {
+        await cp(join(sourceCwd, '.archon'), join(childCwd, '.archon'), { recursive: true });
+      }
       return {
         cwd: childCwd,
         envId: `env-${String(req.childIndex ?? 0)}`,
         branchName: `archon/task-${req.parentRun.id.slice(0, 8)}-child-${String(req.childIndex ?? 0)}`,
+        ...(req.startCommit !== undefined ? { startCommit: req.startCommit } : {}),
       };
     },
   };
@@ -378,6 +385,7 @@ function makeFanResolver(root: string): {
         cwd: dir,
         envId: `env-${req.parentRun.id.slice(0, 8)}-${String(idx)}`,
         branchName: `archon/task-${req.parentRun.id.slice(0, 8)}-child-${String(idx)}`,
+        ...(req.startCommit !== undefined ? { startCommit: req.startCommit } : {}),
       };
     },
   };
@@ -1204,6 +1212,302 @@ nodes:
     expect(child?.status).toBe('completed');
     expect(child?.working_path).toBe(childCwd);
     expect(child?.working_path).not.toBe(cwd);
+    // Absence is part of the legacy request shape: no optional start_commit key is sent.
+    expect(calls[0]).not.toHaveProperty('startCommit');
+    expect(calls[0]?.mode).toBe('create_or_adopt');
+  });
+
+  it('threads a literal start_commit through the child-isolation request', async () => {
+    await writeWorkflow(
+      'child-start-commit',
+      `
+name: child-start-commit
+description: child receiving a declarative checkout identity
+nodes:
+  - id: work
+    prompt: "do the work"
+`
+    );
+    await writeWorkflow(
+      'parent-start-commit',
+      `
+name: parent-start-commit
+description: parent declaring the child's checkout identity
+nodes:
+  - id: sub
+    workflow: child-start-commit
+    isolation: worktree
+    start_commit: "0123456789abcdef0123456789abcdef01234567"
+`
+    );
+
+    const store = new InMemoryStore();
+    const deps = makeDeps(store);
+    const parent = await discover('parent-start-commit');
+    const { resolver, calls } = makeFakeResolver(join(cwd, 'child-start-commit-worktree'), cwd);
+
+    const result = await executeWorkflow(
+      deps,
+      makePlatform(),
+      'conv-plat',
+      cwd,
+      parent,
+      'goal',
+      'conv-db',
+      { resolveChildIsolation: resolver }
+    );
+
+    expect(result.success).toBe(true);
+    expect(calls).toHaveLength(1);
+    expect(calls[0]).toMatchObject({
+      startCommit: '0123456789abcdef0123456789abcdef01234567',
+      mode: 'create_or_adopt',
+    });
+    const child = [...store.runs.values()].find(r => r.workflow_name === 'child-start-commit');
+    expect(child?.metadata.start_commit).toBe('0123456789abcdef0123456789abcdef01234567');
+  });
+
+  it('resumes an exact child only through verify_existing with its persisted SHA and path', async () => {
+    const startCommit = '0123456789abcdef0123456789abcdef01234567';
+    await writeWorkflow(
+      'child-exact-resume',
+      `
+name: child-exact-resume
+description: fails so its parent must verify the persisted isolated child on resume
+nodes:
+  - id: fail
+    bash: "exit 3"
+`
+    );
+    await writeWorkflow(
+      'parent-exact-resume',
+      `
+name: parent-exact-resume
+description: exact child resume must never recreate from a branch
+nodes:
+  - id: sub
+    workflow: child-exact-resume
+    isolation: worktree
+    start_commit: "${startCommit}"
+`
+    );
+
+    const store = new InMemoryStore();
+    const deps = makeDeps(store);
+    const parent = await discover('parent-exact-resume');
+    const childCwd = join(cwd, 'child-exact-resume-worktree');
+    const { resolver, calls } = makeFakeResolver(childCwd, cwd);
+
+    const first = await executeWorkflow(
+      deps,
+      makePlatform(),
+      'conv-plat',
+      cwd,
+      parent,
+      'goal',
+      'conv-db',
+      { resolveChildIsolation: resolver }
+    );
+    expect(first.success).toBe(false);
+    const parentRun = [...store.runs.values()].find(r => r.workflow_name === 'parent-exact-resume');
+    const child = [...store.runs.values()].find(r => r.workflow_name === 'child-exact-resume');
+    expect(child?.metadata.start_commit).toBe(startCommit);
+    expect(child?.working_path).toBe(childCwd);
+
+    const hydrated = await hydrateResumableRun(deps, (await store.getWorkflowRun(parentRun!.id))!);
+    const resumeOpts = hydrated ?? { preCreatedRun: await store.resumeWorkflowRun(parentRun!.id) };
+    const second = await executeWorkflow(
+      deps,
+      makePlatform(),
+      'conv-plat',
+      cwd,
+      parent,
+      'goal',
+      'conv-db',
+      { ...resumeOpts, resolveChildIsolation: resolver }
+    );
+
+    expect(second.success).toBe(false);
+    expect(calls).toHaveLength(2);
+    expect(calls.map(call => ({ mode: call.mode, startCommit: call.startCommit }))).toEqual([
+      { mode: 'create_or_adopt', startCommit },
+      { mode: 'verify_existing', startCommit },
+    ]);
+    expect((await store.getWorkflowRun(child!.id))?.working_path).toBe(childCwd);
+  });
+
+  it('executes an exact child from its verified checkout definition, not parent-side drift', async () => {
+    const startCommit = '0123456789abcdef0123456789abcdef01234567';
+    await writeWorkflow(
+      'child-frozen-source',
+      `
+name: child-frozen-source
+description: mutable parent-side definition
+nodes:
+  - id: work
+    bash: "printf parent-side-drift"
+`
+    );
+    await writeWorkflow(
+      'parent-frozen-source',
+      `
+name: parent-frozen-source
+description: exact child must reload from its frozen checkout
+nodes:
+  - id: sub
+    workflow: child-frozen-source
+    isolation: worktree
+    start_commit: "${startCommit}"
+`
+    );
+
+    const childCwd = join(cwd, 'child-frozen-source-worktree');
+    const resolver: ChildIsolationResolver = {
+      async resolve(req: ChildIsolationRequest): Promise<ChildIsolationResult> {
+        await mkdir(childCwd, { recursive: true });
+        await cp(join(cwd, '.archon'), join(childCwd, '.archon'), { recursive: true });
+        await writeFile(
+          join(childCwd, '.archon', 'workflows', 'child-frozen-source.yaml'),
+          `
+name: child-frozen-source
+description: verified exact checkout definition
+nodes:
+  - id: work
+    bash: "printf frozen-control-asset"
+`
+        );
+        return {
+          cwd: childCwd,
+          envId: 'env-frozen-source',
+          branchName: 'archon/task-frozen-source',
+          ...(req.startCommit !== undefined ? { startCommit: req.startCommit } : {}),
+        };
+      },
+    };
+
+    const store = new InMemoryStore();
+    const result = await executeWorkflow(
+      makeDeps(store),
+      makePlatform(),
+      'conv-plat',
+      cwd,
+      await discover('parent-frozen-source'),
+      'goal',
+      'conv-db',
+      { resolveChildIsolation: resolver }
+    );
+
+    expect(result.success).toBe(true);
+    const child = [...store.runs.values()].find(r => r.workflow_name === 'child-frozen-source');
+    const childEvent = store.events.find(
+      event =>
+        event.workflow_run_id === child?.id &&
+        event.event_type === 'node_completed' &&
+        event.step_name === 'work'
+    );
+    expect(String(childEvent?.data?.node_output)).toContain('frozen-control-asset');
+    expect(String(childEvent?.data?.node_output)).not.toContain('parent-side-drift');
+  });
+
+  it('resolves an output-ref start_commit before dispatching the isolated child', async () => {
+    await writeWorkflow(
+      'child-output-start-commit',
+      `
+name: child-output-start-commit
+description: child receiving a produced checkout identity
+nodes:
+  - id: work
+    prompt: "do the work"
+`
+    );
+    await writeWorkflow(
+      'parent-output-start-commit',
+      `
+name: parent-output-start-commit
+description: parent deriving the child's checkout identity
+nodes:
+  - id: source
+    bash: "printf '{\\"sha\\":\\"0123456789abcdef0123456789abcdef01234567\\"}'"
+  - id: sub
+    workflow: child-output-start-commit
+    isolation: worktree
+    start_commit: "$source.output.sha"
+    depends_on: [source]
+`
+    );
+
+    const store = new InMemoryStore();
+    const deps = makeDeps(store);
+    const parent = await discover('parent-output-start-commit');
+    const { resolver, calls } = makeFakeResolver(
+      join(cwd, 'child-output-start-commit-worktree'),
+      cwd
+    );
+
+    const result = await executeWorkflow(
+      deps,
+      makePlatform(),
+      'conv-plat',
+      cwd,
+      parent,
+      'goal',
+      'conv-db',
+      { resolveChildIsolation: resolver }
+    );
+
+    expect(result.success).toBe(true);
+    expect(calls).toHaveLength(1);
+    expect(calls[0]).toMatchObject({
+      startCommit: '0123456789abcdef0123456789abcdef01234567',
+    });
+  });
+
+  it('rejects a resolved ref before dispatch when the producer emits a branch name', async () => {
+    await writeWorkflow(
+      'child-invalid-start-commit',
+      `
+name: child-invalid-start-commit
+description: child that must not receive a branch ref
+nodes:
+  - id: work
+    prompt: "do the work"
+`
+    );
+    await writeWorkflow(
+      'parent-invalid-start-commit',
+      `
+name: parent-invalid-start-commit
+description: parent with an invalid resolved checkout identity
+nodes:
+  - id: source
+    bash: "printf 'main'"
+  - id: sub
+    workflow: child-invalid-start-commit
+    isolation: worktree
+    start_commit: "$source.output"
+    depends_on: [source]
+`
+    );
+
+    const store = new InMemoryStore();
+    const deps = makeDeps(store);
+    const parent = await discover('parent-invalid-start-commit');
+    const { resolver, calls } = makeFakeResolver(join(cwd, 'should-not-be-used'));
+
+    const result = await executeWorkflow(
+      deps,
+      makePlatform(),
+      'conv-plat',
+      cwd,
+      parent,
+      'goal',
+      'conv-db',
+      { resolveChildIsolation: resolver }
+    );
+
+    expect(result.success).toBe(false);
+    expect(calls).toHaveLength(0);
+    expect([...store.runs.values()].filter(r => r.parent_run_id !== null)).toHaveLength(0);
   });
 
   it("isolation: 'worktree' with NO resolver injected fails the node fast (no shared-checkout fallback)", async () => {
@@ -1257,6 +1561,51 @@ nodes:
     expect(String(nodeFailed?.data?.error)).toContain('requires an injected');
     // Fail-fast happens BEFORE the child row is created — no orphan child.
     expect([...store.runs.values()].filter(r => r.parent_run_id !== null)).toHaveLength(0);
+  });
+
+  it('rejects an exact child before dispatch when the invocation has no git-repo resolver', async () => {
+    await writeWorkflow(
+      'child-exact-folder',
+      `
+name: child-exact-folder
+description: must never run from a folder project
+nodes:
+  - id: work
+    prompt: "do work"
+`
+    );
+    await writeWorkflow(
+      'parent-exact-folder',
+      `
+name: parent-exact-folder
+description: exact child requires a git worktree
+nodes:
+  - id: sub
+    workflow: child-exact-folder
+    isolation: worktree
+    start_commit: "0123456789abcdef0123456789abcdef01234567"
+`
+    );
+
+    const store = new InMemoryStore();
+    const deps = makeDeps(store);
+    const parent = await discover('parent-exact-folder');
+    const result = await executeWorkflow(
+      deps,
+      makePlatform(),
+      'conv-plat',
+      cwd,
+      parent,
+      'goal',
+      'conv-db'
+    );
+
+    expect(result.success).toBe(false);
+    const nodeFailed = store.events.find(
+      event => event.event_type === 'node_failed' && event.step_name === 'sub'
+    );
+    expect(String(nodeFailed?.data?.error)).toContain('folder projects cannot adopt an exact');
+    expect([...store.runs.values()].filter(run => run.parent_run_id !== null)).toHaveLength(0);
   });
 
   it("isolation: 'inherit' (and default) shares the parent's checkout — resolver untouched", async () => {
