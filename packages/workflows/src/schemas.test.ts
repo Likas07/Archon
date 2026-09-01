@@ -304,6 +304,7 @@ describe('dagNodeSchema — absolute deadline timeout', () => {
       },
       timeout: 500,
     },
+    { id: 'workflow', workflow: 'child', timeout: 1000 },
   ])('admits a positive integer timeout on $id nodes', raw => {
     const result = dagNodeSchema.safeParse(raw);
     expect(result.success).toBe(true);
@@ -333,13 +334,32 @@ describe('dagNodeSchema — absolute deadline timeout', () => {
   test.each([
     { id: 'command', command: 'build', timeout: 100 },
     { id: 'approval', approval: { message: 'approve?' }, timeout: 100 },
-    { id: 'workflow', workflow: 'child', timeout: 100 },
   ])('rejects timeout on unsupported $id nodes', raw => {
     const result = dagNodeSchema.safeParse(raw);
     expect(result.success).toBe(false);
     if (!result.success) {
       expect(result.error.issues.some(issue => issue.message.includes('only supported'))).toBe(
         true
+      );
+    }
+  });
+
+  test('rejects timeout on a fan_out workflow node', () => {
+    const result = dagNodeSchema.safeParse({
+      id: 'fan-out',
+      workflow: 'child',
+      timeout: 100,
+      fan_out: { items: '$plan.output' },
+    });
+
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.issues).toContainEqual(
+        expect.objectContaining({
+          path: ['timeout'],
+          message:
+            "'timeout' is not supported on workflow nodes with 'fan_out'; use deadlines inside each child workflow.",
+        })
       );
     }
   });

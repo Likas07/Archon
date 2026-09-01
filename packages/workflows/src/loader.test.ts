@@ -64,6 +64,51 @@ describe('node absolute deadline timeout', () => {
     });
   });
 
+  it('admits timeout on a workflow node and preserves it for the executor', () => {
+    const result = parseWorkflow(
+      [
+        'name: deadline',
+        'description: deadline',
+        'nodes:',
+        '  - id: child',
+        '    workflow: governed-child',
+        '    timeout: 1500',
+      ].join('\n'),
+      'deadline.yaml'
+    );
+
+    expect(result.error).toBeNull();
+    expect(result.workflow?.nodes[0]).toMatchObject({
+      id: 'child',
+      workflow: 'governed-child',
+      timeout: 1500,
+    });
+  });
+
+  it('rejects timeout on a fan_out workflow node', () => {
+    const result = parseWorkflow(
+      [
+        'name: deadline',
+        'description: deadline',
+        'nodes:',
+        '  - id: plan',
+        '    prompt: plan',
+        '  - id: children',
+        '    workflow: governed-child',
+        '    depends_on: [plan]',
+        '    timeout: 1500',
+        '    fan_out:',
+        '      items: $plan.output',
+      ].join('\n'),
+      'deadline.yaml'
+    );
+
+    expect(result.workflow).toBeNull();
+    expect(result.error?.error).toContain(
+      "'timeout' is not supported on workflow nodes with 'fan_out'"
+    );
+  });
+
   it('rejects a fractional timeout on a loop node', () => {
     const result = parseWorkflow(
       [
@@ -99,7 +144,9 @@ describe('node absolute deadline timeout', () => {
     );
 
     expect(result.workflow).toBeNull();
-    expect(result.error?.error).toContain('only supported');
+    expect(result.error?.error).toContain(
+      'only supported on prompt, loop, loop_group, workflow, bash, and script nodes'
+    );
   });
 });
 
