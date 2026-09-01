@@ -2483,6 +2483,135 @@ branch refs/heads/feature/auth
     });
   });
 
+  describe('resolveFullCommitSha', () => {
+    const commit = '0123456789abcdef0123456789abcdef01234567';
+    const otherCommit = 'fedcba9876543210fedcba9876543210fedcba98';
+    let execSpy: Mock<typeof git.execFileAsync>;
+
+    beforeEach(() => {
+      execSpy = spyOn(git, 'execFileAsync');
+    });
+
+    afterEach(() => {
+      execSpy.mockRestore();
+    });
+
+    test('accepts only a reachable literal lowercase commit object', async () => {
+      execSpy
+        .mockResolvedValueOnce({ stdout: `${commit}\n`, stderr: '' })
+        .mockResolvedValueOnce({ stdout: 'refs/heads/main\n', stderr: '' });
+
+      await expect(git.resolveFullCommitSha('/workspace/repo', commit)).resolves.toBe(commit);
+
+      expect(execSpy).toHaveBeenCalledWith(
+        'git',
+        [
+          '-C',
+          '/workspace/repo',
+          'rev-parse',
+          '--verify',
+          '--end-of-options',
+          `${commit}^{commit}`,
+        ],
+        { timeout: 10000 }
+      );
+      expect(execSpy).toHaveBeenCalledWith(
+        'git',
+        ['-C', '/workspace/repo', 'for-each-ref', '--contains', commit, '--format=%(refname)'],
+        { timeout: 10000 }
+      );
+    });
+
+    test.each([
+      ['short SHA', '01234567'],
+      ['branch ref', 'main'],
+      ['tag ref', 'v1.2.3'],
+      ['uppercase SHA', '0123456789ABCDEF0123456789ABCDEF01234567'],
+    ])('rejects a %s before resolving an object', async (_description, value) => {
+      await expect(git.resolveFullCommitSha('/workspace/repo', value)).rejects.toThrow(
+        'full lowercase 40-hex commit SHA'
+      );
+      expect(execSpy).not.toHaveBeenCalled();
+    });
+
+    test('rejects an annotated tag object even when it peels to a commit', async () => {
+      execSpy.mockResolvedValueOnce({ stdout: `${otherCommit}\n`, stderr: '' });
+
+      await expect(git.resolveFullCommitSha('/workspace/repo', commit)).rejects.toThrow(
+        'literal commit object'
+      );
+      expect(execSpy).toHaveBeenCalledTimes(1);
+    });
+
+    test.each(['tree', 'missing object'])('rejects a %s', async description => {
+      execSpy.mockRejectedValueOnce(new Error(`fatal: ${description}`));
+
+      await expect(git.resolveFullCommitSha('/workspace/repo', commit)).rejects.toThrow(
+        'must resolve to a commit object'
+      );
+      expect(execSpy).toHaveBeenCalledTimes(1);
+    });
+
+    test('rejects a commit unreachable from every local ref', async () => {
+      execSpy
+        .mockResolvedValueOnce({ stdout: `${commit}\n`, stderr: '' })
+        .mockResolvedValueOnce({ stdout: '', stderr: '' });
+
+      await expect(git.resolveFullCommitSha('/workspace/repo', commit)).rejects.toThrow(
+        'reachable from a local ref'
+      );
+    });
+  });
+
+  describe('verifyWorktreeHead', () => {
+    const expected = '0123456789abcdef0123456789abcdef01234567' as git.FullCommitSha;
+    const actual = 'fedcba9876543210fedcba9876543210fedcba98';
+    let execSpy: Mock<typeof git.execFileAsync>;
+
+    beforeEach(() => {
+      execSpy = spyOn(git, 'execFileAsync');
+    });
+
+    afterEach(() => {
+      execSpy.mockRestore();
+    });
+
+    test('accepts a worktree whose HEAD is the requested literal commit', async () => {
+      execSpy.mockResolvedValueOnce({ stdout: `${expected}\n`, stderr: '' });
+
+      await expect(
+        git.verifyWorktreeHead('/workspace/worktrees/child', expected)
+      ).resolves.toBeUndefined();
+
+      expect(execSpy).toHaveBeenCalledWith(
+        'git',
+        [
+          '-C',
+          '/workspace/worktrees/child',
+          'rev-parse',
+          '--verify',
+          '--end-of-options',
+          'HEAD^{commit}',
+        ],
+        { timeout: 10000 }
+      );
+    });
+
+    test('rejects a drifted worktree HEAD without issuing a reset', async () => {
+      execSpy.mockResolvedValueOnce({ stdout: `${actual}\n`, stderr: '' });
+
+      await expect(git.verifyWorktreeHead('/workspace/worktrees/child', expected)).rejects.toThrow(
+        'expected exact commit'
+      );
+
+      const resetCalls = execSpy.mock.calls.filter((call: unknown[]) => {
+        const args = call[1] as string[];
+        return args.includes('reset') || args.includes('checkout');
+      });
+      expect(resetCalls).toHaveLength(0);
+    });
+  });
+
   describe('listChildRepos', () => {
     const root = join(tmpdir(), 'archon-childrepos-test-' + Date.now());
 

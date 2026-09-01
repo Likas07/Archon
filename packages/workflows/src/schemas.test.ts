@@ -778,6 +778,51 @@ describe('SCRIPT_NODE_AI_FIELDS', () => {
   });
 });
 
+describe('dagNodeSchema — workflow.start_commit', () => {
+  const fullCommitSha = '0123456789abcdef0123456789abcdef01234567';
+
+  test('accepts a literal start_commit only on an isolated workflow node', () => {
+    const result = dagNodeSchema.safeParse({
+      id: 'sub',
+      workflow: 'child-wf',
+      isolation: 'worktree',
+      start_commit: fullCommitSha,
+    });
+
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect((result.data as { start_commit?: string }).start_commit).toBe(fullCommitSha);
+    }
+  });
+
+  test('accepts an output reference source for an isolated workflow node', () => {
+    const result = dagNodeSchema.safeParse({
+      id: 'sub',
+      workflow: 'child-wf',
+      isolation: 'worktree',
+      start_commit: '$source.output.sha',
+    });
+
+    expect(result.success).toBe(true);
+  });
+
+  test.each([
+    ['a non-workflow node', { id: 'prompt', prompt: 'work' }],
+    ['a workflow without isolation', { id: 'sub', workflow: 'child-wf' }],
+    ['a workflow inheriting isolation', { id: 'sub', workflow: 'child-wf', isolation: 'inherit' }],
+  ])('rejects start_commit on %s', (_description, node) => {
+    const result = dagNodeSchema.safeParse({
+      ...node,
+      start_commit: fullCommitSha,
+    });
+
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.issues.some(issue => issue.path[0] === 'start_commit')).toBe(true);
+    }
+  });
+});
+
 // ---------------------------------------------------------------------------
 // LOOP_NODE_AI_FIELDS constant
 // ---------------------------------------------------------------------------

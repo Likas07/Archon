@@ -18,6 +18,16 @@
 
 import type { WorkflowRun } from './schemas';
 
+/** A fully resolved, lowercase commit object id accepted as a child start point. */
+export type FullCommitSha = string & { readonly __fullCommitSha: unique symbol };
+
+const FULL_COMMIT_SHA_PATTERN = /^[0-9a-f]{40}$/;
+
+/** Narrow an untrusted resolved value to the branded full commit SHA seam. */
+export function parseFullCommitSha(value: string): FullCommitSha | undefined {
+  return FULL_COMMIT_SHA_PATTERN.test(value) ? (value as FullCommitSha) : undefined;
+}
+
 /**
  * Request for a per-child isolated checkout, built by the engine at child-spawn
  * time. The resolver closure supplies the codebase-specific bits (canonical repo
@@ -36,6 +46,8 @@ export interface ChildIsolationRequest {
   childIndex?: number;
   /** Codebase id inherited from the parent run (attribution + resolver guard). */
   codebaseId?: string;
+  /** Optional immutable child checkout start point, resolved before this request. */
+  startCommit?: FullCommitSha;
 }
 
 /**
@@ -50,6 +62,8 @@ export interface ChildIsolationResult {
   envId: string;
   /** The branch created for the child (e.g. `archon/task-<parent>-<node>-<hash>-child-0`). */
   branchName: string;
+  /** The immutable start point used for this child, when one was requested. */
+  startCommit?: FullCommitSha;
 }
 
 /**

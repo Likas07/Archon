@@ -8,8 +8,8 @@ import {
   resolveRepoProjectIdentity,
 } from '@archon/paths';
 import { execFileAsync } from './exec';
-import type { RepoPath, BranchName, WorktreePath, WorktreeInfo } from './types';
-import { toRepoPath, toBranchName, toWorktreePath } from './types';
+import type { RepoPath, BranchName, FullCommitSha, WorktreePath, WorktreeInfo } from './types';
+import { isFullCommitSha, toRepoPath, toBranchName, toWorktreePath } from './types';
 
 /** Lazy-initialized logger (deferred so test mocks can intercept createLogger) */
 let cachedLog: ReturnType<typeof createLogger> | undefined;
@@ -393,6 +393,39 @@ export async function verifyWorktreeOwnership(
     throw new Error(
       `Worktree at ${worktreePath} belongs to a different clone (${existingRepoRaw}). ` +
         'Remove it from that clone or use a different codebase registration.'
+    );
+  }
+}
+
+/**
+ * Verify that an existing or newly-created worktree still has the exact HEAD
+ * requested by an immutable child start point. This never repairs or resets a
+ * mismatched slot: callers must surface the drift rather than overwrite work.
+ */
+export async function verifyWorktreeHead(
+  worktreePath: WorktreePath,
+  expected: FullCommitSha
+): Promise<void> {
+  let actual: string;
+  try {
+    const result = await execFileAsync(
+      'git',
+      ['-C', worktreePath, 'rev-parse', '--verify', '--end-of-options', 'HEAD^{commit}'],
+      { timeout: 10000 }
+    );
+    actual = result.stdout.trim();
+  } catch (error) {
+    const err = error as Error;
+    throw new Error(`Failed to resolve HEAD for worktree ${worktreePath}: ${err.message}`);
+  }
+
+  if (!isFullCommitSha(actual)) {
+    throw new Error(`Worktree at ${worktreePath} has an invalid commit HEAD '${actual}'.`);
+  }
+
+  if (actual !== expected) {
+    throw new Error(
+      `Worktree at ${worktreePath} is at ${actual}, expected exact commit ${expected}; refusing to reset it.`
     );
   }
 }
