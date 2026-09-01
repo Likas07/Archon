@@ -42,6 +42,67 @@ import type { WorkflowDefinition } from './schemas/workflow';
 import * as bundledDefaults from './defaults/bundled-defaults';
 import { parsePackagedResourceReference } from './packaged-workflow';
 
+describe('node absolute deadline timeout', () => {
+  it('admits timeout on a prompt node and preserves it for the executor', () => {
+    const result = parseWorkflow(
+      [
+        'name: deadline',
+        'description: deadline',
+        'nodes:',
+        '  - id: prompt',
+        '    prompt: do it',
+        '    timeout: 1500',
+      ].join('\n'),
+      'deadline.yaml'
+    );
+
+    expect(result.error).toBeNull();
+    expect(result.workflow?.nodes[0]).toMatchObject({
+      id: 'prompt',
+      prompt: 'do it',
+      timeout: 1500,
+    });
+  });
+
+  it('rejects a fractional timeout on a loop node', () => {
+    const result = parseWorkflow(
+      [
+        'name: deadline',
+        'description: deadline',
+        'nodes:',
+        '  - id: loop',
+        '    timeout: 1.5',
+        '    loop:',
+        '      prompt: iterate',
+        '      until: DONE',
+        '      max_iterations: 2',
+      ].join('\n'),
+      'deadline.yaml'
+    );
+
+    expect(result.workflow).toBeNull();
+    expect(result.error?.error).toContain('positive integer');
+  });
+
+  it('rejects timeout on approval nodes because human wait is exempt', () => {
+    const result = parseWorkflow(
+      [
+        'name: deadline',
+        'description: deadline',
+        'nodes:',
+        '  - id: approve',
+        '    timeout: 1000',
+        '    approval:',
+        '      message: approve?',
+      ].join('\n'),
+      'deadline.yaml'
+    );
+
+    expect(result.workflow).toBeNull();
+    expect(result.error?.error).toContain('only supported');
+  });
+});
+
 describe('Workflow Loader', () => {
   let testDir: string;
   const originalArchonHome = process.env.ARCHON_HOME;
