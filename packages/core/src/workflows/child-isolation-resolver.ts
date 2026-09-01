@@ -128,87 +128,6 @@ function getLog(): ReturnType<typeof createLogger> {
 }
 
 /**
- * Verify that the exact checkout still carries the committed factory authority and
- * generated runtime assets that a branded child is about to execute. The Git tree
- * at startCommit is the control receipt here: its blob ids bind every asset byte.
- *
- * A child may legitimately edit product source before a resume, so this scopes the
- * clean/hash check to the two frozen authority roots rather than rejecting all
- * worktree changes. Untracked files under either root are also forbidden: otherwise
- * a generated command or workflow could be supplied outside the control commit.
- */
-async function verifyExactChildAssets(
-  worktreePath: string,
-  startCommit: GitFullCommitSha
-): Promise<void> {
-  const assetRoots = ['.archon/factory', '.archon/workflows'];
-  const tree = await git.execFileAsync(
-    'git',
-    ['-C', worktreePath, 'ls-tree', '-r', '-z', '--full-tree', startCommit, '--', ...assetRoots],
-    { timeout: 10000 }
-  );
-  const entries = tree.stdout
-    .split('\0')
-    .filter(entry => entry.length > 0)
-    .map(entry => {
-      const match = /^(\d{6})\s+blob\s+([0-9a-f]+)\t(.+)$/.exec(entry);
-      if (!match) {
-        throw new Error(
-          `Cannot verify exact child assets at ${worktreePath}: invalid control-tree entry.`
-        );
-      }
-      return { mode: match[1], blob: match[2], path: match[3] };
-    });
-  const hasFactoryBundle = entries.some(entry => entry.path.startsWith('.archon/factory/'));
-  const hasGeneratedAssets = entries.some(entry => entry.path.startsWith('.archon/workflows/'));
-  if (!hasFactoryBundle || !hasGeneratedAssets) {
-    throw new Error(
-      `Cannot verify exact child assets at ${worktreePath}: control commit ${startCommit} ` +
-        'must contain both frozen .archon/factory and generated .archon/workflows assets.'
-    );
-  }
-  if (entries.some(entry => entry.mode === '120000')) {
-    throw new Error(
-      `Cannot verify exact child assets at ${worktreePath}: frozen assets must not be symlinks.`
-    );
-  }
-
-  const status = await git.execFileAsync(
-    'git',
-    [
-      '-C',
-      worktreePath,
-      'status',
-      '--porcelain=v1',
-      '-z',
-      '--untracked-files=all',
-      '--',
-      ...assetRoots,
-    ],
-    { timeout: 10000 }
-  );
-  if (status.stdout.length > 0) {
-    throw new Error(
-      `Cannot verify exact child assets at ${worktreePath}: frozen bundle or generated ` +
-        'runtime assets differ from the control receipt.'
-    );
-  }
-
-  try {
-    await git.execFileAsync(
-      'git',
-      ['-C', worktreePath, 'diff', '--quiet', '--no-ext-diff', startCommit, '--', ...assetRoots],
-      { timeout: 10000 }
-    );
-  } catch {
-    throw new Error(
-      `Cannot verify exact child assets at ${worktreePath}: frozen bundle or generated ` +
-        'runtime asset hashes differ from the control receipt.'
-    );
-  }
-}
-
-/**
  * Build a {@link ChildIsolationResolver} bound to one codebase. `resolve()` creates
  * a per-child worktree + branch (`archon/task-<parent>-<node>-<hash>-child-<i>`) and registers it.
  * Throws (surfaced by the engine as a failed node outcome) when the worktree cannot
@@ -326,11 +245,6 @@ export function createChildWorktreeResolver(
             worktreePath,
             req.startCommit as unknown as GitFullCommitSha
           );
-          await verifyExactChildAssets(
-            persisted.working_path,
-            req.startCommit as unknown as GitFullCommitSha
-          );
-
           getLog().info(
             {
               parentRunId: req.parentRun.id,
@@ -370,12 +284,6 @@ export function createChildWorktreeResolver(
         ) {
           throw new Error(
             `Child worktree for '${req.nodeId}' did not verify requested exact commit ${req.startCommit}.`
-          );
-        }
-        if (req.startCommit !== undefined) {
-          await verifyExactChildAssets(
-            isolatedEnv.workingPath,
-            req.startCommit as unknown as GitFullCommitSha
           );
         }
 

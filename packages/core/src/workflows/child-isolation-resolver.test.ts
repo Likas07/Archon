@@ -11,8 +11,6 @@ import { describe, test, expect, mock, beforeEach } from 'bun:test';
 
 /** Flipped per-test to simulate the provider adopting an existing worktree. */
 let nextCreateAdopts = false;
-let nextAssetStatus = '';
-let nextAssetDiffFails = false;
 
 const mockProviderCreate = mock((_req: { identifier: string; startCommit?: string }) =>
   Promise.resolve({
@@ -49,24 +47,7 @@ const mockVerifyWorktreeHead = mock(() => Promise.resolve());
 const mockListWorktrees = mock(() =>
   Promise.resolve([{ path: '/wt/path' as never, branch: 'archon/task-stub' as never }])
 );
-const controlBlobHash = 'c'.repeat(40);
-const mockExecFileAsync = mock((_command: string, args: string[]) => {
-  if (args.includes('ls-tree')) {
-    return Promise.resolve({
-      stdout:
-        `100644 blob ${controlBlobHash}\t.archon/factory/plan/authority.lock.json\0` +
-        `100644 blob ${controlBlobHash}\t.archon/workflows/factory/plan/plan.yaml\0`,
-      stderr: '',
-    });
-  }
-  if (args.includes('status')) {
-    return Promise.resolve({ stdout: nextAssetStatus, stderr: '' });
-  }
-  if (args.includes('diff') && nextAssetDiffFails) {
-    return Promise.reject(new Error('git diff reported changed asset bytes'));
-  }
-  return Promise.resolve({ stdout: '', stderr: '' });
-});
+const mockExecFileAsync = mock(() => Promise.resolve({ stdout: '', stderr: '' }));
 
 mock.module('@archon/git', () => ({
   toBranchName: (value: string) => value as never,
@@ -218,8 +199,6 @@ describe('createChildWorktreeResolver', () => {
 
   beforeEach(() => {
     nextCreateAdopts = false;
-    nextAssetStatus = '';
-    nextAssetDiffFails = false;
     mockProviderCreate.mockClear();
     mockIsolationDbCreate.mockClear();
     mockIsolationDbFindActiveByWorkflow.mockClear();
@@ -351,9 +330,6 @@ describe('createChildWorktreeResolver', () => {
     expect(mockProviderCreate.mock.calls[0][0].startCommit).toBe(startCommit);
     expect(mockIsolationDbCreate.mock.calls[0][0].metadata.start_commit).toBe(startCommit);
     expect(result.startCommit).toBe(startCommit);
-    expect(mockExecFileAsync.mock.calls.map(call => call[1])).toContainEqual(
-      expect.arrayContaining(['ls-tree', startCommit, '.archon/factory', '.archon/workflows'])
-    );
   });
 
   test('verify_existing reuses only the persisted same-SHA worktree without provider creation', async () => {
@@ -389,22 +365,6 @@ describe('createChildWorktreeResolver', () => {
       branchName: 'archon/task-stub',
       startCommit,
     });
-  });
-
-  test('an exact child refuses changed generated assets before the environment row is registered', async () => {
-    nextAssetDiffFails = true;
-
-    await expect(
-      resolver.resolve({
-        parentRun,
-        nodeId: 'refactor-auth',
-        codebaseId: 'cb-1',
-        startCommit: 'a'.repeat(40) as never,
-        mode: 'create_or_adopt',
-      })
-    ).rejects.toThrow('frozen bundle or generated runtime asset hashes differ');
-
-    expect(mockIsolationDbCreate).not.toHaveBeenCalled();
   });
 
   test('verify_existing fails closed when the persisted identity is missing', async () => {
