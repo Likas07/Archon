@@ -123,3 +123,8 @@ test-results/
 
 # Stray run logs from a mis-threaded logDir argument (see #2299) — never committed.
 main/
+
+# SQLite test artifacts. Bun's sqlite driver materializes a file for a
+# `file:...?mode=memory&cache=shared` URI, so `bun run test` drops these into
+# packages/core/. They have been committed by accident more than once.
+packages/core/file:archon-test-sqlite-*
