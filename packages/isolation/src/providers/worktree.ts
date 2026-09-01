@@ -19,6 +19,8 @@ import {
   mkdirAsync,
   removeWorktree,
   syncWorkspace,
+  resolveFullCommitSha,
+  verifyWorktreeHead,
   verifyWorktreeOwnership,
   worktreeExists,
   toRepoPath,
@@ -27,7 +29,7 @@ import {
 } from '@archon/git';
 import type { WorktreeBaseOverride } from '@archon/git';
 import { getArchonWorkspacesPath } from '@archon/paths';
-import type { RepoPath, WorktreeInfo } from '@archon/git';
+import type { FullCommitSha, RepoPath, WorktreeInfo } from '@archon/git';
 import { copyWorktreeFiles } from '../worktree-copy';
 import type {
   DestroyResult,
@@ -128,6 +130,14 @@ export class WorktreeProvider implements IIsolationProvider {
    * object or `null`, never a second chance to reload.
    */
   async create(request: IsolationRequest): Promise<IsolatedEnvironment> {
+    // Resolve the immutable literal before loading config or creating a path.
+    // A short SHA, tag object, missing object, or unreachable commit must fail
+    // before this provider can create a worktree for it.
+    const startCommit =
+      request.startCommit === undefined
+        ? undefined
+        : await resolveFullCommitSha(request.canonicalRepoPath, request.startCommit);
+
     let repoConfig: WorktreeCreateConfig | null;
     try {
       repoConfig = await this.loadConfig(request.canonicalRepoPath);
@@ -146,13 +156,19 @@ export class WorktreeProvider implements IIsolationProvider {
     const envId = worktreePath;
 
     // Check for existing worktree (adoption)
-    const existing = await this.findExisting(request, branchName, worktreePath);
+    const existing = await this.findExisting(request, branchName, worktreePath, startCommit);
     if (existing) {
       return existing;
     }
 
     // Create new worktree (re-uses the already-loaded repoConfig — no double load).
-    const { warnings } = await this.createWorktree(request, worktreePath, branchName, repoConfig);
+    const { warnings } = await this.createWorktree(
+      request,
+      worktreePath,
+      branchName,
+      repoConfig,
+      startCommit
+    );
 
     return {
       id: envId,
@@ -162,6 +178,7 @@ export class WorktreeProvider implements IIsolationProvider {
       status: 'active',
       createdAt: new Date(),
       metadata: { adopted: false, request },
+      ...(startCommit !== undefined ? { startCommit } : {}),
       ...(warnings.length > 0 ? { warnings } : {}),
     };
   }
@@ -607,7 +624,8 @@ export class WorktreeProvider implements IIsolationProvider {
   private async findExisting(
     request: IsolationRequest,
     branchName: string,
-    worktreePath: string
+    worktreePath: string,
+    startCommit: FullCommitSha | undefined
   ): Promise<WorktreeEnvironment | null> {
     // Check if worktree already exists at expected path
     if (await worktreeExists(toWorktreePath(worktreePath))) {
@@ -633,12 +651,23 @@ export class WorktreeProvider implements IIsolationProvider {
         throw err;
       }
 
+      if (startCommit !== undefined) {
+        await this.verifyExactWorktreeSlot(request.canonicalRepoPath, worktreePath, branchName);
+        await verifyWorktreeHead(toWorktreePath(worktreePath), startCommit);
+      }
+
       getLog().info({ worktreePath, branchName }, 'worktree_adopted');
-      return this.buildAdoptedEnvironment(worktreePath, branchName, request);
+      return this.buildAdoptedEnvironment(
+        worktreePath,
+        branchName,
+        request,
+        undefined,
+        startCommit
+      );
     }
 
     // For PRs: also check if skill created a worktree with the PR's branch name
-    if (isPRIsolationRequest(request)) {
+    if (startCommit === undefined && isPRIsolationRequest(request)) {
       const existingByBranch = await findWorktreeByBranch(
         request.canonicalRepoPath,
         request.prBranch
@@ -674,11 +703,39 @@ export class WorktreeProvider implements IIsolationProvider {
     return null;
   }
 
+  /**
+   * Exact adoption must prove the filesystem slot is still the registered
+   * worktree for the branch this request owns. `HEAD` alone cannot distinguish
+   * a detached slot or one that another branch has claimed at the same commit.
+   */
+  private async verifyExactWorktreeSlot(
+    repoPath: RepoPath,
+    worktreePath: string,
+    expectedBranch: string
+  ): Promise<void> {
+    const registered = (await listWorktrees(repoPath)).find(
+      worktree => resolve(worktree.path) === resolve(worktreePath)
+    );
+
+    if (!registered) {
+      throw new Error(
+        `Cannot adopt exact worktree at ${worktreePath}: slot is not registered on requested branch ${expectedBranch}; refusing to report or modify it.`
+      );
+    }
+
+    if (registered.branch !== expectedBranch) {
+      throw new Error(
+        `Cannot adopt exact worktree at ${worktreePath}: slot is registered to branch ${registered.branch}, expected ${expectedBranch}; refusing to report or modify it.`
+      );
+    }
+  }
+
   private buildAdoptedEnvironment(
     path: string,
     branchName: string,
     request: IsolationRequest,
-    adoptedFrom?: 'branch'
+    adoptedFrom?: 'branch',
+    startCommit?: FullCommitSha
   ): WorktreeEnvironment {
     return {
       id: path,
@@ -688,6 +745,7 @@ export class WorktreeProvider implements IIsolationProvider {
       status: 'active',
       createdAt: new Date(),
       metadata: { adopted: true, ...(adoptedFrom ? { adoptedFrom } : {}), request },
+      ...(startCommit !== undefined ? { startCommit } : {}),
     };
   }
 
@@ -703,9 +761,27 @@ export class WorktreeProvider implements IIsolationProvider {
     request: IsolationRequest,
     worktreePath: string,
     branchName: string,
-    worktreeConfig: WorktreeCreateConfig | null
+    worktreeConfig: WorktreeCreateConfig | null,
+    startCommit: FullCommitSha | undefined
   ): Promise<{ warnings: string[] }> {
     const repoPath = request.canonicalRepoPath;
+
+    if (startCommit !== undefined) {
+      await this.createExactWorktree(repoPath, worktreePath, branchName, startCommit);
+      await verifyWorktreeHead(toWorktreePath(worktreePath), startCommit);
+
+      if (request.gitIdentity?.email) {
+        await this.applyGitIdentity(worktreePath, request.gitIdentity);
+      }
+      if (worktreeConfig?.initSubmodules !== false) {
+        await this.initSubmodules(worktreePath, true);
+      }
+
+      // Copying ignored files from the canonical checkout would make an exact
+      // child depend on its parent's tracked or untracked state. Its source is
+      // the literal commit only, so the normal copy-files convenience is skipped.
+      return { warnings: [] };
+    }
 
     // Resolve git remote name: explicit config > auto-detect > actionable error
     const remote = await this.resolveRemote(repoPath, worktreeConfig?.remote);
@@ -764,6 +840,39 @@ export class WorktreeProvider implements IIsolationProvider {
       );
     }
     return { warnings };
+  }
+
+  /**
+   * Create an immutable child from the supplied literal commit. No remote
+   * discovery, fetch, workspace sync, reset, or branch-start fallback belongs
+   * on this path; a stale branch is an error rather than permission to move it.
+   */
+  private async createExactWorktree(
+    repoPath: RepoPath,
+    worktreePath: string,
+    branchName: string,
+    startCommit: FullCommitSha
+  ): Promise<void> {
+    if (await this.directoryExists(worktreePath)) {
+      throw new Error(
+        `Cannot create exact worktree at ${worktreePath}: slot already exists; refusing to remove it.`
+      );
+    }
+    await execFileAsync(
+      'git',
+      [
+        '-C',
+        repoPath,
+        'worktree',
+        'add',
+        '--no-track',
+        worktreePath,
+        '-b',
+        branchName,
+        startCommit,
+      ],
+      { timeout: GIT_OPERATION_TIMEOUT_MS }
+    );
   }
 
   /**
@@ -1213,13 +1322,15 @@ export class WorktreeProvider implements IIsolationProvider {
    * Initialize git submodules in a worktree when the repo uses them.
    *
    * ENOENT on `.gitmodules` → skip (zero-cost for non-submodule repos).
+   * Exact worktrees pass `noFetch` so Git fails when the pinned submodule
+   * object is absent locally instead of resolving it over the network.
    * Any other error (EACCES, EIO, git failure, timeout) → throw. Silent
    * success on a half-initialized worktree is the exact class of bug this
    * function exists to prevent; an unreadable `.gitmodules` is materially
    * the same as a failed git op. The thrown error is classified by
    * `classifyIsolationError` into an actionable message.
    */
-  private async initSubmodules(worktreePath: string): Promise<void> {
+  private async initSubmodules(worktreePath: string, noFetch = false): Promise<void> {
     try {
       await access(join(worktreePath, '.gitmodules'));
     } catch (error) {
@@ -1236,7 +1347,15 @@ export class WorktreeProvider implements IIsolationProvider {
     try {
       await execFileAsync(
         'git',
-        ['-C', worktreePath, 'submodule', 'update', '--init', '--recursive'],
+        [
+          '-C',
+          worktreePath,
+          'submodule',
+          'update',
+          '--init',
+          '--recursive',
+          ...(noFetch ? ['--no-fetch'] : []),
+        ],
         { timeout: 120000 }
       );
       getLog().info({ worktreePath }, 'worktree.submodule_init_completed');

@@ -6,7 +6,7 @@
  * enables future strategies (containers, VMs).
  */
 
-import type { RepoPath, BranchName } from '@archon/git';
+import type { RepoPath, BranchName, FullCommitSha } from '@archon/git';
 import type {
   ExecutionContext,
   WriteBackFinalizeResult,
@@ -84,6 +84,13 @@ interface IsolationRequestBase {
    * ambient git identity (unchanged behavior).
    */
   gitIdentity?: { email: string; name?: string };
+
+  /**
+   * Immutable literal commit requested for this worktree. When present, the
+   * provider validates it locally and creates or adopts only a worktree whose
+   * HEAD exactly matches; branch-based creation remains unchanged when absent.
+   */
+  startCommit?: FullCommitSha;
 }
 
 export interface IssueIsolationRequest extends IsolationRequestBase {
@@ -160,6 +167,8 @@ interface IsolatedEnvironmentBase {
 export interface WorktreeEnvironment extends IsolatedEnvironmentBase {
   provider: 'worktree';
   branchName: BranchName;
+  /** Verified immutable start point when this environment was created/adopted exactly. */
+  startCommit?: FullCommitSha;
   metadata: WorktreeMetadata;
 }
 

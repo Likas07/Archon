@@ -7,12 +7,13 @@ import { getDefaultBranch } from './branch';
 import type {
   RepoPath,
   BranchName,
+  FullCommitSha,
   GitResult,
   WorkspaceSyncResult,
   WorkspaceSyncMode,
   WorkspaceSyncState,
 } from './types';
-import { toRepoPath } from './types';
+import { isFullCommitSha, toRepoPath } from './types';
 
 /** Lazy-initialized logger (deferred so test mocks can intercept createLogger) */
 let cachedLog: ReturnType<typeof createLogger> | undefined;
@@ -46,6 +47,71 @@ export async function findRepoRoot(startPath: string): Promise<RepoPath | null> 
     getLog().error({ startPath, err, stderr: err.stderr }, 'find_repo_root_failed');
     throw new Error(`Failed to find repo root for ${startPath}: ${err.message}`);
   }
+}
+
+/**
+ * Resolve a user-supplied exact child start point to a safe commit identity.
+ *
+ * Syntax is deliberately checked before invoking Git so abbreviated SHAs,
+ * branch names, and tag names cannot become a moving reference. `^{commit}`
+ * proves the object can resolve as a commit; equality with the literal input
+ * rejects annotated tag objects that Git would otherwise peel. Finally, the
+ * commit must be reachable from at least one locally present ref. No remote
+ * operation occurs in this validation path.
+ */
+export async function resolveFullCommitSha(
+  repoPath: RepoPath,
+  value: string
+): Promise<FullCommitSha> {
+  if (!isFullCommitSha(value)) {
+    throw new Error(
+      `Exact start commit must be a full lowercase 40-hex commit SHA (got '${value}').`
+    );
+  }
+
+  let resolved: string;
+  try {
+    const result = await execFileAsync(
+      'git',
+      ['-C', repoPath, 'rev-parse', '--verify', '--end-of-options', `${value}^{commit}`],
+      { timeout: 10000 }
+    );
+    resolved = result.stdout.trim();
+  } catch (error) {
+    const err = error as Error;
+    throw new Error(
+      `Exact start commit '${value}' must resolve to a commit object in ${repoPath}: ${err.message}`
+    );
+  }
+
+  if (!isFullCommitSha(resolved) || resolved !== value) {
+    throw new Error(
+      `Exact start commit '${value}' must name the literal commit object, not a tag object.`
+    );
+  }
+
+  let containingRefs: string;
+  try {
+    const result = await execFileAsync(
+      'git',
+      ['-C', repoPath, 'for-each-ref', '--contains', value, '--format=%(refname)'],
+      { timeout: 10000 }
+    );
+    containingRefs = result.stdout.trim();
+  } catch (error) {
+    const err = error as Error;
+    throw new Error(
+      `Failed to verify local reachability for exact start commit '${value}' in ${repoPath}: ${err.message}`
+    );
+  }
+
+  if (!containingRefs) {
+    throw new Error(
+      `Exact start commit '${value}' must be reachable from a local ref in ${repoPath}.`
+    );
+  }
+
+  return value;
 }
 
 /**
