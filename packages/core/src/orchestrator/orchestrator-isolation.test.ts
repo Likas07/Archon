@@ -352,6 +352,7 @@ describe('dispatchBackgroundWorkflow', () => {
     mockResolve.mockClear();
     mockUpdateConversation.mockClear();
     mockCreateWorkflowRun.mockClear();
+    mockExecuteWorkflow.mockClear();
     mockLogger.info.mockClear();
     mockGetOrCreateConversation.mockResolvedValue(
       makeConversation({ id: 'worker-conv-1', platform_conversation_id: 'web-worker-1' })
@@ -405,5 +406,39 @@ describe('dispatchBackgroundWorkflow', () => {
     );
 
     await flushBackgroundExecution();
+  });
+
+  test('repo background dispatch injects the child resolver, while folder dispatch leaves exact children fail-closed', async () => {
+    mockResolve.mockResolvedValueOnce({
+      status: 'resolved',
+      env: makeEnvRow({ working_path: '/worktrees/bg-repo', branch_name: 'bg-repo' }),
+      cwd: '/worktrees/bg-repo',
+      method: { type: 'created' },
+    });
+
+    await dispatchBackgroundWorkflow(makeRoutingCtx(), makeWorkflow());
+    await flushBackgroundExecution();
+
+    const repoOptions = mockExecuteWorkflow.mock.calls[0]?.[7] as {
+      resolveChildIsolation?: unknown;
+    };
+    expect(repoOptions.resolveChildIsolation).toBeDefined();
+
+    mockExecuteWorkflow.mockClear();
+    mockResolve.mockResolvedValueOnce({
+      status: 'resolved',
+      env: makeEnvRow({ provider: 'container', working_path: '/folder/bg' }),
+      cwd: '/folder/bg',
+      method: { type: 'created' },
+    });
+    mockGetCodebase.mockResolvedValueOnce(makeCodebase({ kind: 'folder' }));
+
+    await dispatchBackgroundWorkflow(makeRoutingCtx(), makeWorkflow());
+    await flushBackgroundExecution();
+
+    const folderOptions = mockExecuteWorkflow.mock.calls[0]?.[7] as {
+      resolveChildIsolation?: unknown;
+    };
+    expect(folderOptions.resolveChildIsolation).toBeUndefined();
   });
 });

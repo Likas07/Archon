@@ -11,8 +11,10 @@ import { describe, test, expect, mock, beforeEach } from 'bun:test';
 
 /** Flipped per-test to simulate the provider adopting an existing worktree. */
 let nextCreateAdopts = false;
+let nextAssetStatus = '';
+let nextAssetDiffFails = false;
 
-const mockProviderCreate = mock((_req: { identifier: string }) =>
+const mockProviderCreate = mock((_req: { identifier: string; startCommit?: string }) =>
   Promise.resolve({
     id: '/wt/path',
     provider: 'worktree' as const,
@@ -21,6 +23,7 @@ const mockProviderCreate = mock((_req: { identifier: string }) =>
     status: 'active' as const,
     createdAt: new Date(),
     metadata: { adopted: nextCreateAdopts },
+    ...(_req.startCommit !== undefined ? { startCommit: _req.startCommit } : {}),
   })
 );
 
@@ -38,9 +41,47 @@ mock.module('@archon/isolation', () => ({
 const mockIsolationDbCreate = mock((_env: { metadata: Record<string, unknown> }) =>
   Promise.resolve({ id: 'env-1' })
 );
+const mockIsolationDbFindActiveByWorkflow = mock(() => Promise.resolve(null));
+
+const mockWorktreeExists = mock(() => Promise.resolve(true));
+const mockVerifyWorktreeOwnership = mock(() => Promise.resolve());
+const mockVerifyWorktreeHead = mock(() => Promise.resolve());
+const mockListWorktrees = mock(() =>
+  Promise.resolve([{ path: '/wt/path' as never, branch: 'archon/task-stub' as never }])
+);
+const controlBlobHash = 'c'.repeat(40);
+const mockExecFileAsync = mock((_command: string, args: string[]) => {
+  if (args.includes('ls-tree')) {
+    return Promise.resolve({
+      stdout:
+        `100644 blob ${controlBlobHash}\t.archon/factory/plan/authority.lock.json\0` +
+        `100644 blob ${controlBlobHash}\t.archon/workflows/factory/plan/plan.yaml\0`,
+      stderr: '',
+    });
+  }
+  if (args.includes('status')) {
+    return Promise.resolve({ stdout: nextAssetStatus, stderr: '' });
+  }
+  if (args.includes('diff') && nextAssetDiffFails) {
+    return Promise.reject(new Error('git diff reported changed asset bytes'));
+  }
+  return Promise.resolve({ stdout: '', stderr: '' });
+});
+
+mock.module('@archon/git', () => ({
+  toBranchName: (value: string) => value as never,
+  toRepoPath: (value: string) => value as never,
+  toWorktreePath: (value: string) => value as never,
+  worktreeExists: mockWorktreeExists,
+  verifyWorktreeOwnership: mockVerifyWorktreeOwnership,
+  verifyWorktreeHead: mockVerifyWorktreeHead,
+  listWorktrees: mockListWorktrees,
+  execFileAsync: mockExecFileAsync,
+}));
 
 mock.module('../db/isolation-environments', () => ({
   create: mockIsolationDbCreate,
+  findActiveByWorkflow: mockIsolationDbFindActiveByWorkflow,
 }));
 
 const { buildChildIdentifier, createChildWorktreeResolver } =
@@ -177,8 +218,16 @@ describe('createChildWorktreeResolver', () => {
 
   beforeEach(() => {
     nextCreateAdopts = false;
+    nextAssetStatus = '';
+    nextAssetDiffFails = false;
     mockProviderCreate.mockClear();
     mockIsolationDbCreate.mockClear();
+    mockIsolationDbFindActiveByWorkflow.mockClear();
+    mockWorktreeExists.mockClear();
+    mockVerifyWorktreeOwnership.mockClear();
+    mockVerifyWorktreeHead.mockClear();
+    mockListWorktrees.mockClear();
+    mockExecFileAsync.mockClear();
     mockConfigureIsolation.mockClear();
   });
 
@@ -210,7 +259,12 @@ describe('createChildWorktreeResolver', () => {
     );
 
     await expect(
-      resolver.resolve({ parentRun, nodeId: 'refactor-auth', codebaseId: 'cb-1' })
+      resolver.resolve({
+        parentRun,
+        nodeId: 'refactor-auth',
+        codebaseId: 'cb-1',
+        mode: 'create_or_adopt',
+      })
     ).rejects.toThrow('classified: No space left on device');
 
     // Failure happens before registration — no orphan environment row.
@@ -222,7 +276,12 @@ describe('createChildWorktreeResolver', () => {
     // it was wired to the wrong project, and creating a checkout in the wrong repo is
     // worse than failing. Guard had no coverage.
     await expect(
-      resolver.resolve({ parentRun, nodeId: 'refactor-auth', codebaseId: 'cb-OTHER' })
+      resolver.resolve({
+        parentRun,
+        nodeId: 'refactor-auth',
+        codebaseId: 'cb-OTHER',
+        mode: 'create_or_adopt',
+      })
     ).rejects.toThrow(/bound to codebase 'cb-1'.*carries codebase 'cb-OTHER'/s);
 
     expect(mockProviderCreate).not.toHaveBeenCalled();
@@ -230,8 +289,18 @@ describe('createChildWorktreeResolver', () => {
   });
 
   test('two isolated sub-run nodes in one parent request distinct worktrees', async () => {
-    await resolver.resolve({ parentRun, nodeId: 'refactor-auth', codebaseId: 'cb-1' });
-    await resolver.resolve({ parentRun, nodeId: 'refactor-billing', codebaseId: 'cb-1' });
+    await resolver.resolve({
+      parentRun,
+      nodeId: 'refactor-auth',
+      codebaseId: 'cb-1',
+      mode: 'create_or_adopt',
+    });
+    await resolver.resolve({
+      parentRun,
+      nodeId: 'refactor-billing',
+      codebaseId: 'cb-1',
+      mode: 'create_or_adopt',
+    });
 
     expect(mockProviderCreate).toHaveBeenCalledTimes(2);
     const [first, second] = mockProviderCreate.mock.calls.map(call => call[0].identifier);
@@ -247,14 +316,174 @@ describe('createChildWorktreeResolver', () => {
     // durable half of that signal (a WARN is emitted alongside it).
     nextCreateAdopts = true;
 
-    await resolver.resolve({ parentRun, nodeId: 'refactor-auth', codebaseId: 'cb-1' });
+    await resolver.resolve({
+      parentRun,
+      nodeId: 'refactor-auth',
+      codebaseId: 'cb-1',
+      mode: 'create_or_adopt',
+    });
 
     expect(mockIsolationDbCreate.mock.calls[0][0].metadata.adopted).toBe(true);
   });
 
   test('a freshly created worktree is not recorded as adopted', async () => {
-    await resolver.resolve({ parentRun, nodeId: 'refactor-auth', codebaseId: 'cb-1' });
+    await resolver.resolve({
+      parentRun,
+      nodeId: 'refactor-auth',
+      codebaseId: 'cb-1',
+      mode: 'create_or_adopt',
+    });
 
     expect(mockIsolationDbCreate.mock.calls[0][0].metadata.adopted).toBe(false);
+  });
+
+  test('persists and returns the exact start identity supplied for a branded child', async () => {
+    const startCommit = 'a'.repeat(40) as never;
+
+    const result = await resolver.resolve({
+      parentRun,
+      nodeId: 'refactor-auth',
+      codebaseId: 'cb-1',
+      startCommit,
+      mode: 'create_or_adopt',
+    });
+
+    expect(mockProviderCreate.mock.calls[0][0].startCommit).toBe(startCommit);
+    expect(mockIsolationDbCreate.mock.calls[0][0].metadata.start_commit).toBe(startCommit);
+    expect(result.startCommit).toBe(startCommit);
+    expect(mockExecFileAsync.mock.calls.map(call => call[1])).toContainEqual(
+      expect.arrayContaining(['ls-tree', startCommit, '.archon/factory', '.archon/workflows'])
+    );
+  });
+
+  test('verify_existing reuses only the persisted same-SHA worktree without provider creation', async () => {
+    const startCommit = 'a'.repeat(40) as never;
+    const identifier = buildChildIdentifier(PARENT_RUN_ID, 'refactor-auth', 0);
+    mockIsolationDbFindActiveByWorkflow.mockResolvedValueOnce({
+      id: 'env-1',
+      workflow_id: identifier,
+      working_path: '/wt/path',
+      branch_name: 'archon/task-stub',
+      metadata: {
+        parent_run_id: PARENT_RUN_ID,
+        child_index: 0,
+        start_commit: startCommit,
+      },
+    });
+
+    const result = await resolver.resolve({
+      parentRun,
+      nodeId: 'refactor-auth',
+      codebaseId: 'cb-1',
+      startCommit,
+      mode: 'verify_existing',
+    });
+
+    expect(mockProviderCreate).not.toHaveBeenCalled();
+    expect(mockWorktreeExists).toHaveBeenCalledWith('/wt/path');
+    expect(mockVerifyWorktreeOwnership).toHaveBeenCalledWith('/wt/path', '/repo');
+    expect(mockVerifyWorktreeHead).toHaveBeenCalledWith('/wt/path', startCommit);
+    expect(result).toEqual({
+      cwd: '/wt/path',
+      envId: 'env-1',
+      branchName: 'archon/task-stub',
+      startCommit,
+    });
+  });
+
+  test('an exact child refuses changed generated assets before the environment row is registered', async () => {
+    nextAssetDiffFails = true;
+
+    await expect(
+      resolver.resolve({
+        parentRun,
+        nodeId: 'refactor-auth',
+        codebaseId: 'cb-1',
+        startCommit: 'a'.repeat(40) as never,
+        mode: 'create_or_adopt',
+      })
+    ).rejects.toThrow('frozen bundle or generated runtime asset hashes differ');
+
+    expect(mockIsolationDbCreate).not.toHaveBeenCalled();
+  });
+
+  test('verify_existing fails closed when the persisted identity is missing', async () => {
+    mockIsolationDbFindActiveByWorkflow.mockResolvedValueOnce({
+      id: 'env-1',
+      workflow_id: buildChildIdentifier(PARENT_RUN_ID, 'refactor-auth', 0),
+      working_path: '/wt/path',
+      branch_name: 'archon/task-stub',
+      metadata: { parent_run_id: PARENT_RUN_ID, child_index: 0 },
+    });
+
+    await expect(
+      resolver.resolve({
+        parentRun,
+        nodeId: 'refactor-auth',
+        codebaseId: 'cb-1',
+        startCommit: 'a'.repeat(40) as never,
+        mode: 'verify_existing',
+      })
+    ).rejects.toThrow('no immutable start_commit');
+
+    expect(mockProviderCreate).not.toHaveBeenCalled();
+  });
+
+  test('verify_existing fails closed when the persisted path is gone', async () => {
+    const startCommit = 'a'.repeat(40) as never;
+    mockIsolationDbFindActiveByWorkflow.mockResolvedValueOnce({
+      id: 'env-1',
+      workflow_id: buildChildIdentifier(PARENT_RUN_ID, 'refactor-auth', 0),
+      working_path: '/wt/path',
+      branch_name: 'archon/task-stub',
+      metadata: {
+        parent_run_id: PARENT_RUN_ID,
+        child_index: 0,
+        start_commit: startCommit,
+      },
+    });
+    mockWorktreeExists.mockResolvedValueOnce(false);
+
+    await expect(
+      resolver.resolve({
+        parentRun,
+        nodeId: 'refactor-auth',
+        codebaseId: 'cb-1',
+        startCommit,
+        mode: 'verify_existing',
+      })
+    ).rejects.toThrow('persisted worktree is missing');
+
+    expect(mockProviderCreate).not.toHaveBeenCalled();
+  });
+
+  test('verify_existing fails closed on an exact HEAD mismatch', async () => {
+    const startCommit = 'a'.repeat(40) as never;
+    mockIsolationDbFindActiveByWorkflow.mockResolvedValueOnce({
+      id: 'env-1',
+      workflow_id: buildChildIdentifier(PARENT_RUN_ID, 'refactor-auth', 0),
+      working_path: '/wt/path',
+      branch_name: 'archon/task-stub',
+      metadata: {
+        parent_run_id: PARENT_RUN_ID,
+        child_index: 0,
+        start_commit: startCommit,
+      },
+    });
+    mockVerifyWorktreeHead.mockRejectedValueOnce(
+      new Error('worktree HEAD differs from requested exact commit')
+    );
+
+    await expect(
+      resolver.resolve({
+        parentRun,
+        nodeId: 'refactor-auth',
+        codebaseId: 'cb-1',
+        startCommit,
+        mode: 'verify_existing',
+      })
+    ).rejects.toThrow('classified: worktree HEAD differs from requested exact commit');
+
+    expect(mockProviderCreate).not.toHaveBeenCalled();
   });
 });

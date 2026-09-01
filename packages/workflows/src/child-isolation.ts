@@ -48,6 +48,11 @@ export interface ChildIsolationRequest {
   codebaseId?: string;
   /** Optional immutable child checkout start point, resolved before this request. */
   startCommit?: FullCommitSha;
+  /**
+   * `create_or_adopt` may create the deterministic child slot; `verify_existing`
+   * may only verify the persisted slot and must never recreate it from a branch.
+   */
+  mode: 'create_or_adopt' | 'verify_existing';
 }
 
 /**

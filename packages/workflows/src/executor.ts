@@ -41,7 +41,11 @@ import { isRegisteredProvider, getRegisteredProviders } from '@archon/providers'
 import type { ExecutionContext } from '@archon/providers/types';
 import type { ContainerRunContext } from './container-context';
 export type { ContainerRunContext, ContainerWriteBackBackend } from './container-context';
-import type { ChildIsolationResolver, ChildIsolationResult } from './child-isolation';
+import {
+  parseFullCommitSha,
+  type ChildIsolationResolver,
+  type ChildIsolationResult,
+} from './child-isolation';
 export type {
   ChildIsolationResolver,
   ChildIsolationRequest,
@@ -668,11 +672,21 @@ async function runChildWorkflow(
     error,
   });
 
+  const resolveChildWorkflowAt = async (
+    workflowCwd: string
+  ): Promise<WorkflowDefinition | undefined> => {
+    const { workflows } = await discoverWorkflowsWithConfig(workflowCwd, deps.loadConfig);
+    return resolveWorkflowName(
+      childWorkflowName,
+      workflows.map(entry => entry.workflow)
+    );
+  };
+
   // 1. Resolve the child workflow by NAME (static target — constitution guardrail).
   //    Resolution runs BEFORE the cycle check so a case-variant / suffix / substring
   //    reference to an ancestor (e.g. `workflow: SELFIE` naming its own run) is caught
   //    as a cycle by canonical name, not left to the less-informative depth cap.
-  let childWorkflow: WorkflowDefinition | undefined;
+  let resolvedChildWorkflow: WorkflowDefinition | undefined;
   try {
     // DELIBERATE AFFORDANCE — do not "fix" this by adding a load-time existence
     // check for `workflow:` targets. Discovery runs HERE, when the node executes,
@@ -682,20 +696,17 @@ async function runChildWorkflow(
     // table (reference/workflow-language-constitution.md) and locked by
     // `describe('workflow: late resolution is a deliberate affordance')` in
     // subrun.test.ts.
-    const { workflows } = await discoverWorkflowsWithConfig(cwd, deps.loadConfig);
-    childWorkflow = resolveWorkflowName(
-      childWorkflowName,
-      workflows.map(w => w.workflow)
-    );
+    resolvedChildWorkflow = await resolveChildWorkflowAt(cwd);
   } catch (err) {
     // resolveWorkflowName throws only on ambiguity.
     return failOutcome(
       `Failed to resolve sub-run '${childWorkflowName}': ${(err as Error).message}`
     );
   }
-  if (!childWorkflow) {
+  if (!resolvedChildWorkflow) {
     return failOutcome(`Unknown sub-run workflow '${childWorkflowName}'.`);
   }
+  let childWorkflow: WorkflowDefinition = resolvedChildWorkflow;
 
   // 2. Cycle guard + depth cap (D9), compared against the RESOLVED canonical name.
   //    The child's ancestor chain is the parent plus the parent's ancestors; a
@@ -784,9 +795,76 @@ async function runChildWorkflow(
         resumeFailedChild.id
       );
     }
-    childCwd = priorPath;
+
+    const resumeMetadata = readSubrunMetadata(resumeFailedChild.metadata);
+    const persistedStartCommit = parseFullCommitSha(resumeMetadata.startCommit ?? '');
+    const isExactResume = startCommit !== undefined || resumeMetadata.startCommit !== undefined;
+    if (isExactResume) {
+      if (persistedStartCommit === undefined) {
+        return failOutcome(
+          `Cannot resume exact sub-run '${childWorkflowName}': its child-run metadata has no valid ` +
+            'immutable start_commit.',
+          resumeFailedChild.id
+        );
+      }
+      if (startCommit !== undefined && startCommit !== persistedStartCommit) {
+        return failOutcome(
+          `Cannot resume exact sub-run '${childWorkflowName}': the current start_commit ${startCommit} ` +
+            `does not match persisted ${persistedStartCommit}.`,
+          resumeFailedChild.id
+        );
+      }
+      if (isolation !== 'worktree' || !resolveChildIsolation) {
+        return failOutcome(
+          `Cannot resume exact sub-run '${childWorkflowName}': start_commit requires a git-repo ` +
+            'child-isolation resolver; folder projects cannot adopt an exact child checkout.',
+          resumeFailedChild.id
+        );
+      }
+      try {
+        childIsolationEnv = await resolveChildIsolation.resolve({
+          parentRun,
+          nodeId,
+          childIndex,
+          codebaseId,
+          startCommit: persistedStartCommit,
+          mode: 'verify_existing',
+        });
+      } catch (err) {
+        return failOutcome(
+          `Failed to verify existing isolated worktree for sub-run '${childWorkflowName}': ` +
+            (err as Error).message,
+          resumeFailedChild.id
+        );
+      }
+      if (childIsolationEnv.cwd !== priorPath) {
+        return failOutcome(
+          `Cannot resume exact sub-run '${childWorkflowName}': verified worktree path ` +
+            `${childIsolationEnv.cwd} does not match persisted ${priorPath}.`,
+          resumeFailedChild.id
+        );
+      }
+      if (childIsolationEnv.startCommit !== persistedStartCommit) {
+        return failOutcome(
+          `Cannot resume exact sub-run '${childWorkflowName}': resolver did not return persisted ` +
+            `start_commit ${persistedStartCommit}.`,
+          resumeFailedChild.id
+        );
+      }
+      childCwd = childIsolationEnv.cwd;
+    } else {
+      // Legacy children have no start_commit. Preserve their existing recorded-path
+      // resume behavior and never introduce an exact checkout verification path.
+      childCwd = priorPath;
+    }
   } else if (isolation === 'worktree') {
     if (!resolveChildIsolation) {
+      if (startCommit !== undefined) {
+        return failOutcome(
+          `Exact sub-run '${childWorkflowName}' requires a git-repo child-isolation resolver; ` +
+            'folder projects cannot adopt an exact child checkout.'
+        );
+      }
       return failOutcome(
         `isolation: 'worktree' on sub-run '${childWorkflowName}' requires an injected ` +
           'child-isolation resolver (available for git-repo codebases run via the CLI or ' +
@@ -799,8 +877,15 @@ async function runChildWorkflow(
         nodeId,
         childIndex,
         codebaseId,
+        mode: 'create_or_adopt',
         ...(startCommit !== undefined ? { startCommit } : {}),
       });
+      if (startCommit !== undefined && childIsolationEnv.startCommit !== startCommit) {
+        return failOutcome(
+          `Failed to create isolated worktree for sub-run '${childWorkflowName}': resolver did not ` +
+            `verify requested start_commit ${startCommit}.`
+        );
+      }
       childCwd = childIsolationEnv.cwd;
     } catch (err) {
       // The resolver already classified + logged the failure (child-isolation-resolver);
@@ -811,6 +896,48 @@ async function runChildWorkflow(
     }
   } else {
     childCwd = cwd;
+  }
+
+  // A branded child must execute the workflow definition committed in its verified
+  // exact worktree. The pre-isolation lookup above remains a late-resolution/cycle
+  // preflight only; using that parent-side definition for provider launch would let
+  // dirty parent YAML or runtime assets override the frozen control commit.
+  if (childIsolationEnv?.startCommit !== undefined) {
+    let frozenChildWorkflow: WorkflowDefinition | undefined;
+    try {
+      frozenChildWorkflow = await resolveChildWorkflowAt(childCwd);
+    } catch (err) {
+      return failOutcome(
+        `Failed to verify frozen sub-run '${childWorkflowName}' in exact checkout: ` +
+          (err as Error).message,
+        resumeFailedChild?.id ?? ''
+      );
+    }
+    if (!frozenChildWorkflow) {
+      return failOutcome(
+        `Cannot run exact sub-run '${childWorkflowName}': its verified checkout has no matching ` +
+          'frozen workflow definition.',
+        resumeFailedChild?.id ?? ''
+      );
+    }
+    if (ancestry.some(run => run.workflow_name === frozenChildWorkflow.name)) {
+      return failOutcome(
+        `Sub-run cycle detected: '${frozenChildWorkflow.name}' is already an ancestor of this run.`,
+        resumeFailedChild?.id ?? ''
+      );
+    }
+    childWorkflow = frozenChildWorkflow;
+    try {
+      const resolved = resolveDeclaredInputs(
+        inputs ?? {},
+        childWorkflow.inputs,
+        `Node '${nodeId}'`,
+        `frozen sub-run workflow '${childWorkflow.name}'`
+      );
+      childInputs = Object.keys(resolved).length > 0 ? resolved : undefined;
+    } catch (err) {
+      return failOutcome((err as Error).message, resumeFailedChild?.id ?? '');
+    }
   }
 
   // 4. Create the child run row (fresh) or hydrate the failed one (resume path).
@@ -868,8 +995,11 @@ async function runChildWorkflow(
           // can find it. Absent for `inherit`/shared-checkout children.
           ...(childIsolationEnv
             ? {
-                isolation_env_id: childIsolationEnv.envId,
-                branch_name: childIsolationEnv.branchName,
+                [SUBRUN_METADATA_KEYS.isolationEnvId]: childIsolationEnv.envId,
+                [SUBRUN_METADATA_KEYS.branchName]: childIsolationEnv.branchName,
+                ...(childIsolationEnv.startCommit !== undefined
+                  ? { [SUBRUN_METADATA_KEYS.startCommit]: childIsolationEnv.startCommit }
+                  : {}),
               }
             : {}),
         },

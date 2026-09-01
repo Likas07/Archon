@@ -28,6 +28,7 @@ import {
   classifyIsolationError,
 } from '@archon/isolation';
 import * as git from '@archon/git';
+import type { FullCommitSha as GitFullCommitSha } from '@archon/git';
 import { createLogger } from '@archon/paths';
 import { loadRepoConfig } from '../config/config-loader';
 import * as isolationDb from '../db/isolation-environments';
@@ -127,6 +128,87 @@ function getLog(): ReturnType<typeof createLogger> {
 }
 
 /**
+ * Verify that the exact checkout still carries the committed factory authority and
+ * generated runtime assets that a branded child is about to execute. The Git tree
+ * at startCommit is the control receipt here: its blob ids bind every asset byte.
+ *
+ * A child may legitimately edit product source before a resume, so this scopes the
+ * clean/hash check to the two frozen authority roots rather than rejecting all
+ * worktree changes. Untracked files under either root are also forbidden: otherwise
+ * a generated command or workflow could be supplied outside the control commit.
+ */
+async function verifyExactChildAssets(
+  worktreePath: string,
+  startCommit: GitFullCommitSha
+): Promise<void> {
+  const assetRoots = ['.archon/factory', '.archon/workflows'];
+  const tree = await git.execFileAsync(
+    'git',
+    ['-C', worktreePath, 'ls-tree', '-r', '-z', '--full-tree', startCommit, '--', ...assetRoots],
+    { timeout: 10000 }
+  );
+  const entries = tree.stdout
+    .split('\0')
+    .filter(entry => entry.length > 0)
+    .map(entry => {
+      const match = /^(\d{6})\s+blob\s+([0-9a-f]+)\t(.+)$/.exec(entry);
+      if (!match) {
+        throw new Error(
+          `Cannot verify exact child assets at ${worktreePath}: invalid control-tree entry.`
+        );
+      }
+      return { mode: match[1], blob: match[2], path: match[3] };
+    });
+  const hasFactoryBundle = entries.some(entry => entry.path.startsWith('.archon/factory/'));
+  const hasGeneratedAssets = entries.some(entry => entry.path.startsWith('.archon/workflows/'));
+  if (!hasFactoryBundle || !hasGeneratedAssets) {
+    throw new Error(
+      `Cannot verify exact child assets at ${worktreePath}: control commit ${startCommit} ` +
+        'must contain both frozen .archon/factory and generated .archon/workflows assets.'
+    );
+  }
+  if (entries.some(entry => entry.mode === '120000')) {
+    throw new Error(
+      `Cannot verify exact child assets at ${worktreePath}: frozen assets must not be symlinks.`
+    );
+  }
+
+  const status = await git.execFileAsync(
+    'git',
+    [
+      '-C',
+      worktreePath,
+      'status',
+      '--porcelain=v1',
+      '-z',
+      '--untracked-files=all',
+      '--',
+      ...assetRoots,
+    ],
+    { timeout: 10000 }
+  );
+  if (status.stdout.length > 0) {
+    throw new Error(
+      `Cannot verify exact child assets at ${worktreePath}: frozen bundle or generated ` +
+        'runtime assets differ from the control receipt.'
+    );
+  }
+
+  try {
+    await git.execFileAsync(
+      'git',
+      ['-C', worktreePath, 'diff', '--quiet', '--no-ext-diff', startCommit, '--', ...assetRoots],
+      { timeout: 10000 }
+    );
+  } catch {
+    throw new Error(
+      `Cannot verify exact child assets at ${worktreePath}: frozen bundle or generated ` +
+        'runtime asset hashes differ from the control receipt.'
+    );
+  }
+}
+
+/**
  * Build a {@link ChildIsolationResolver} bound to one codebase. `resolve()` creates
  * a per-child worktree + branch (`archon/task-<parent>-<node>-<hash>-child-<i>`) and registers it.
  * Throws (surfaced by the engine as a failed node outcome) when the worktree cannot
@@ -179,6 +261,95 @@ export function createChildWorktreeResolver(
       const identifier = buildChildIdentifier(req.parentRun.id, req.nodeId, childIndex);
 
       try {
+        if (req.mode === 'verify_existing') {
+          if (req.startCommit === undefined) {
+            throw new Error(
+              `Cannot verify child worktree '${identifier}': no immutable start_commit was supplied.`
+            );
+          }
+
+          const persisted = await isolationDb.findActiveByWorkflow(
+            config.codebaseId,
+            'task',
+            identifier
+          );
+          if (!persisted) {
+            throw new Error(
+              `Cannot verify child worktree '${identifier}': its active isolation metadata is missing.`
+            );
+          }
+
+          const persistedStartCommit = persisted.metadata.start_commit;
+          if (typeof persistedStartCommit !== 'string') {
+            throw new Error(
+              `Cannot verify child worktree '${identifier}': its isolation metadata has no immutable start_commit.`
+            );
+          }
+          if (persistedStartCommit !== req.startCommit) {
+            throw new Error(
+              `Cannot verify child worktree '${identifier}': persisted start_commit ${persistedStartCommit} ` +
+                `does not match requested ${req.startCommit}.`
+            );
+          }
+          if (
+            persisted.metadata.parent_run_id !== req.parentRun.id ||
+            persisted.metadata.child_index !== childIndex
+          ) {
+            throw new Error(
+              `Cannot verify child worktree '${identifier}': its isolation metadata belongs to a different child slot.`
+            );
+          }
+          if (!persisted.working_path) {
+            throw new Error(
+              `Cannot verify child worktree '${identifier}': its persisted worktree path is missing.`
+            );
+          }
+
+          const canonicalRepoPath = git.toRepoPath(config.canonicalRepoPath);
+          const worktreePath = git.toWorktreePath(persisted.working_path);
+          if (!(await git.worktreeExists(worktreePath))) {
+            throw new Error(
+              `Cannot verify child worktree '${identifier}': its persisted worktree is missing at ` +
+                `${persisted.working_path}.`
+            );
+          }
+          await git.verifyWorktreeOwnership(worktreePath, canonicalRepoPath);
+          const registered = await git.listWorktrees(canonicalRepoPath);
+          const registeredSlot = registered.find(worktree => worktree.path === worktreePath);
+          if (registeredSlot?.branch !== persisted.branch_name) {
+            throw new Error(
+              `Cannot verify child worktree '${identifier}': its persisted path/branch is not registered ` +
+                'by the canonical repository.'
+            );
+          }
+          await git.verifyWorktreeHead(
+            worktreePath,
+            req.startCommit as unknown as GitFullCommitSha
+          );
+          await verifyExactChildAssets(
+            persisted.working_path,
+            req.startCommit as unknown as GitFullCommitSha
+          );
+
+          getLog().info(
+            {
+              parentRunId: req.parentRun.id,
+              nodeId: req.nodeId,
+              childIndex,
+              branch: persisted.branch_name,
+              envId: persisted.id,
+              startCommit: req.startCommit,
+            },
+            'workflow.child_worktree_verified_existing'
+          );
+          return {
+            cwd: persisted.working_path,
+            envId: persisted.id,
+            branchName: persisted.branch_name,
+            startCommit: req.startCommit,
+          };
+        }
+
         const provider = getIsolationProvider();
         const isolatedEnv = await provider.create({
           workflowType: 'task',
@@ -188,7 +359,25 @@ export function createChildWorktreeResolver(
           codebaseName: config.codebaseName,
           canonicalRepoPath: git.toRepoPath(config.canonicalRepoPath),
           description: `sub-run child ${String(childIndex)} (node ${req.nodeId})`,
+          ...(req.startCommit !== undefined
+            ? { startCommit: req.startCommit as unknown as GitFullCommitSha }
+            : {}),
         });
+
+        if (
+          req.startCommit !== undefined &&
+          isolatedEnv.startCommit !== (req.startCommit as unknown as GitFullCommitSha)
+        ) {
+          throw new Error(
+            `Child worktree for '${req.nodeId}' did not verify requested exact commit ${req.startCommit}.`
+          );
+        }
+        if (req.startCommit !== undefined) {
+          await verifyExactChildAssets(
+            isolatedEnv.workingPath,
+            req.startCommit as unknown as GitFullCommitSha
+          );
+        }
 
         // Register the env so `isolation list`/`cleanup`/`complete <branch>` see it.
         const envRecord = await isolationDb.create({
@@ -208,6 +397,7 @@ export function createChildWorktreeResolver(
             parent_run_id: req.parentRun.id,
             child_index: childIndex,
             adopted: isolatedEnv.metadata.adopted,
+            ...(req.startCommit !== undefined ? { start_commit: req.startCommit } : {}),
           },
         });
 
@@ -264,6 +454,7 @@ export function createChildWorktreeResolver(
           cwd: isolatedEnv.workingPath,
           envId: envRecord.id,
           branchName: isolatedEnv.branchName,
+          ...(req.startCommit !== undefined ? { startCommit: req.startCommit } : {}),
         };
       } catch (err) {
         const error = err as Error;
