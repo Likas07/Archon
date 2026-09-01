@@ -747,7 +747,7 @@ export class WorktreeProvider implements IIsolationProvider {
     // without submodules pay nothing. Default-on matches git's own intent
     // with `clone --recurse-submodules` / `submodule.recurse`.
     if (worktreeConfig?.initSubmodules !== false) {
-      await this.initSubmodules(worktreePath);
+      await this.initSubmodules(worktreePath, false);
     }
 
     // Copy git-ignored files based on repo config
@@ -1219,7 +1219,7 @@ export class WorktreeProvider implements IIsolationProvider {
    * the same as a failed git op. The thrown error is classified by
    * `classifyIsolationError` into an actionable message.
    */
-  private async initSubmodules(worktreePath: string): Promise<void> {
+  private async initSubmodules(worktreePath: string, noFetch = false): Promise<void> {
     try {
       await access(join(worktreePath, '.gitmodules'));
     } catch (error) {
@@ -1233,10 +1233,71 @@ export class WorktreeProvider implements IIsolationProvider {
       );
     }
 
+    // When noFetch is true, verify that all submodules are already initialized
+    // locally before attempting to update them. This prevents git from cloning
+    // uninitialized submodules from the remote (--no-fetch only prevents fetches
+    // on already-cloned submodules, not initial clones during --init).
+    if (noFetch) {
+      // `--no-fetch` alone does NOT make this local-only: it suppresses fetching
+      // INTO an already-cloned submodule, but `--init` still clones one that has
+      // never been checked out. Verified empirically — a fresh clone run with
+      // `--init --recursive --no-fetch` prints "Cloning into ..." and succeeds.
+      // So the local-availability check has to happen here, before git runs.
+      //
+      // `--recursive` because the update below is recursive. Without it the check
+      // sees only top-level submodules, so a parent that IS initialized but whose
+      // own nested submodule is not passes the guard, and the recursive update
+      // then clones that nested one from its remote — the exact network access
+      // this refusal exists to prevent. An uninitialized top-level still reports
+      // as uninitialized under `--recursive` (git cannot descend into it), so the
+      // shallower case keeps failing the same way.
+      let statusOut: string;
+      try {
+        const { stdout } = await execFileAsync(
+          'git',
+          ['-C', worktreePath, 'submodule', 'status', '--recursive'],
+          {
+            timeout: GIT_OPERATION_TIMEOUT_MS,
+          }
+        );
+        statusOut = stdout;
+      } catch (error) {
+        const err = error as Error;
+        getLog().error({ err, worktreePath }, 'worktree.submodule_status_check_failed');
+        throw new Error(`Failed to check submodule status: ${err.message}`);
+      }
+
+      // Each `git submodule status` line is
+      //   <status-char><sha> <path> [(<describe>)]
+      // where a leading '-' means the submodule is not initialized locally.
+      const uninitialized = statusOut
+        .split('\n')
+        .filter(line => line.startsWith('-'))
+        .map(line => line.slice(1).trim().split(/\s+/)[1])
+        .filter((path): path is string => path !== undefined && path !== '');
+
+      if (uninitialized.length > 0) {
+        getLog().error({ worktreePath, uninitialized }, 'worktree.submodule_not_locally_available');
+        throw new Error(
+          `Submodule initialization would require network access: ${uninitialized.join(', ')} ` +
+            'not available locally. An exact worktree pins an immutable base, so it must not ' +
+            'depend on what a remote serves.'
+        );
+      }
+    }
+
     try {
       await execFileAsync(
         'git',
-        ['-C', worktreePath, 'submodule', 'update', '--init', '--recursive'],
+        [
+          '-C',
+          worktreePath,
+          'submodule',
+          'update',
+          '--init',
+          '--recursive',
+          ...(noFetch ? ['--no-fetch'] : []),
+        ],
         { timeout: 120000 }
       );
       getLog().info({ worktreePath }, 'worktree.submodule_init_completed');

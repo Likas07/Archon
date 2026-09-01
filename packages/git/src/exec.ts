@@ -68,7 +68,13 @@ export function resolveBashPath(): string {
 export async function execFileAsync(
   cmd: string,
   args: string[],
-  options?: { timeout?: number; cwd?: string; maxBuffer?: number; env?: NodeJS.ProcessEnv }
+  options?: {
+    timeout?: number;
+    cwd?: string;
+    maxBuffer?: number;
+    env?: NodeJS.ProcessEnv;
+    signal?: AbortSignal;
+  }
 ): Promise<{ stdout: string; stderr: string }> {
   const result = await promisifiedExecFile(cmd, args, options);
   return {

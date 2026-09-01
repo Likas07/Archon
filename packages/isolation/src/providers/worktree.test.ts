@@ -1115,6 +1115,125 @@ describe('WorktreeProvider', () => {
       );
     });
 
+    test('refuses a noFetch init when a submodule is not available locally', async () => {
+      // `--no-fetch` does NOT make this local-only: it suppresses fetching INTO an
+      // already-cloned submodule, but `--init` still clones one that was never
+      // checked out. Verified against real git. So an exact worktree — whose whole
+      // purpose is an immutable base — must refuse before git runs, not rely on a
+      // flag that does not do what its name suggests.
+      const provider2 = new WorktreeProvider(async () => ({
+        baseBranch: 'main',
+        initSubmodules: true,
+      }));
+      makeGitmodulesPresent();
+
+      execSpy.mockImplementation(async (_cmd: string, args: string[]) => {
+        if (args.includes('submodule') && args.includes('status')) {
+          // Leading '-' is git's marker for an uninitialized submodule.
+          return {
+            stdout: '-f8fad7af8e6d452582653ea2f5b3446771b9c97d vendor\n',
+            stderr: '',
+          };
+        }
+        return { stdout: '', stderr: '' };
+      });
+
+      const initSubmodules = (
+        provider2 as unknown as { initSubmodules(w: string, n: boolean): Promise<void> }
+      ).initSubmodules.bind(provider2);
+
+      await expect(initSubmodules('/workspace/worktree', true)).rejects.toThrow(
+        /would require network access: vendor/
+      );
+
+      // The refusal must land BEFORE git could clone.
+      const ranUpdate = execSpy.mock.calls.some((call: unknown[]) =>
+        (call[1] as string[]).includes('update')
+      );
+      expect(ranUpdate).toBe(false);
+    });
+
+    test('refuses a noFetch init when a NESTED submodule is not available locally', async () => {
+      // The update below is recursive, so the check has to be too. Verified
+      // against real git: with an initialized top-level submodule whose own
+      // nested submodule was never checked out, plain `submodule status` reports
+      // a clean tree while `submodule status --recursive` reports the nested one
+      // as uninitialized -- and `update --init --recursive --no-fetch` then
+      // prints "Cloning into ..." and reaches the network.
+      //
+      // This mock answers the two forms differently, so a check that drops
+      // --recursive sees the clean answer and lets the clone happen.
+      const provider2 = new WorktreeProvider(async () => ({
+        baseBranch: 'main',
+        initSubmodules: true,
+      }));
+      makeGitmodulesPresent();
+
+      execSpy.mockImplementation(async (_cmd: string, args: string[]) => {
+        if (args.includes('submodule') && args.includes('status')) {
+          if (!args.includes('--recursive')) {
+            return {
+              stdout: ' f8fad7af8e6d452582653ea2f5b3446771b9c97d vendor (heads/main)\n',
+              stderr: '',
+            };
+          }
+          return {
+            stdout:
+              ' f8fad7af8e6d452582653ea2f5b3446771b9c97d vendor (heads/main)\n' +
+              '-2ae6c5cf90fddc2fe28de1c5c3335766f6be742f vendor/nested\n',
+            stderr: '',
+          };
+        }
+        return { stdout: '', stderr: '' };
+      });
+
+      const initSubmodules = (
+        provider2 as unknown as { initSubmodules(w: string, n: boolean): Promise<void> }
+      ).initSubmodules.bind(provider2);
+
+      await expect(initSubmodules('/workspace/worktree', true)).rejects.toThrow(
+        /would require network access: vendor\/nested/
+      );
+
+      const ranUpdate = execSpy.mock.calls.some((call: unknown[]) =>
+        (call[1] as string[]).includes('update')
+      );
+      expect(ranUpdate).toBe(false);
+    });
+
+    test('allows a noFetch init when every submodule is already local', async () => {
+      // Guards the refusal above from passing for the wrong reason: if the check
+      // rejected unconditionally, exact worktrees could never initialize at all.
+      const provider2 = new WorktreeProvider(async () => ({
+        baseBranch: 'main',
+        initSubmodules: true,
+      }));
+      makeGitmodulesPresent();
+
+      execSpy.mockImplementation(async (_cmd: string, args: string[]) => {
+        if (args.includes('submodule') && args.includes('status')) {
+          return {
+            stdout: ' f8fad7af8e6d452582653ea2f5b3446771b9c97d vendor (heads/main)\n',
+            stderr: '',
+          };
+        }
+        return { stdout: '', stderr: '' };
+      });
+
+      const initSubmodules = (
+        provider2 as unknown as { initSubmodules(w: string, n: boolean): Promise<void> }
+      ).initSubmodules.bind(provider2);
+
+      await initSubmodules('/workspace/worktree', true);
+
+      const updateArgs = execSpy.mock.calls.find((call: unknown[]) =>
+        (call[1] as string[]).includes('update')
+      )?.[1] as string[] | undefined;
+      expect(updateArgs).toEqual(
+        expect.arrayContaining(['submodule', 'update', '--init', '--no-fetch'])
+      );
+    });
+
     test('throws when .gitmodules read fails with EACCES (fail-fast, no silent skip)', async () => {
       const configLoader: RepoConfigLoader = async () => ({
         baseBranch: 'main',

@@ -19,6 +19,7 @@ import type {
   ProviderCapabilities,
 } from '@archon/providers/types';
 import type { RawAliasesConfig, RawTiersConfig } from './model-validation';
+import type { WorkflowClock } from './clock';
 
 // Re-export provider types so existing workflow engine consumers don't break
 export type {
@@ -115,6 +116,8 @@ export interface WorkflowDeps {
   store: IWorkflowStore;
   getAgentProvider: AgentProviderFactory;
   loadConfig: (cwd: string) => Promise<WorkflowConfig>;
+  /** Optional fakeable clock for absolute node deadlines. */
+  clock?: WorkflowClock;
   /**
    * Optional: resolve a fresh GitHub bot token for the given (owner, repo).
    * Used to inject GH_TOKEN/GITHUB_TOKEN into bash/script subprocess env so

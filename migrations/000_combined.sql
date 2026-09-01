@@ -314,6 +314,26 @@ COMMENT ON TABLE remote_agent_workflow_node_sessions IS
   'Per-node provider session IDs persisted across workflow re-runs. Keyed by (workflow, node, scope, provider). Scope is typically conversation UUID. No cascade on conversation delete (soft delete + never-reused UUID = harmless orphans); a future hard-delete path must delete by scope_key.';
 
 -- ============================================================================
+-- Workflow node absolute deadlines (persisted across restart and resume)
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS remote_agent_workflow_node_deadlines (
+  workflow_run_id UUID NOT NULL REFERENCES remote_agent_workflow_runs(id) ON DELETE CASCADE,
+  -- TEXT, not VARCHAR(n): a node key is `<loop_group>.<body node>` namespaced,
+  -- and dagNodeBaseSchema puts no length bound on a node id. A narrower column
+  -- fails the INSERT, and a deadline that cannot be persisted is a deadline that
+  -- is never enforced — the node runs unbounded instead of timing out.
+  node_key TEXT NOT NULL,
+  started_at TIMESTAMP WITH TIME ZONE NOT NULL,
+  deadline_at TIMESTAMP WITH TIME ZONE NOT NULL,
+  expiry_reason TEXT,
+  PRIMARY KEY (workflow_run_id, node_key)
+);
+
+COMMENT ON TABLE remote_agent_workflow_node_deadlines IS
+  'Write-once absolute deadline for a workflow node. The original start and deadline survive process restart and resume; expiry_reason is recorded when the node times out.';
+
+-- ============================================================================
 -- Table 7: Messages
 -- ============================================================================
 

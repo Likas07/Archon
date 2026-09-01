@@ -98,6 +98,8 @@ import {
   logWorkflowError,
 } from './logger';
 import { withIdleTimeout, STEP_IDLE_TIMEOUT_MS } from './utils/idle-timeout';
+import { systemWorkflowClock, type WorkflowClock } from './clock';
+import type { IWorkflowStore } from './store';
 import { mapWithLimit } from './utils/map-with-limit';
 import {
   classifyError,
@@ -514,6 +516,52 @@ const ACTIVITY_HEARTBEAT_INTERVAL_MS = 60_000;
 /** Default DAG node retry for TRANSIENT errors */
 const DEFAULT_NODE_MAX_RETRIES = 2;
 const DEFAULT_NODE_RETRY_DELAY_MS = 3000;
+const NO_NODE_RETRIES = { maxRetries: 0, delayMs: 0, onError: 'transient' as const };
+export const NODE_DEADLINE_EXCEEDED = 'deadline_exceeded';
+const NODE_DEADLINE_CLEANUP_UNCONFIRMED = 'deadline_exceeded_cleanup_unconfirmed';
+const liveProviderAbortControllers = new Map<string, Set<AbortController>>();
+
+function registerProviderAbortController(
+  workflowRunId: string,
+  controller: AbortController
+): () => void {
+  const controllers = liveProviderAbortControllers.get(workflowRunId) ?? new Set();
+  controllers.add(controller);
+  liveProviderAbortControllers.set(workflowRunId, controllers);
+  return (): void => {
+    controllers.delete(controller);
+    if (controllers.size === 0) liveProviderAbortControllers.delete(workflowRunId);
+  };
+}
+
+function abortInFlightProviderWork(workflowRunId: string): void {
+  for (const controller of liveProviderAbortControllers.get(workflowRunId) ?? []) {
+    controller.abort(NODE_DEADLINE_EXCEEDED);
+  }
+}
+
+/**
+ * An abort signal for a run's DETERMINISTIC work — bash and script subprocesses.
+ *
+ * Registered in the same per-run registry as provider controllers, so a wrapper
+ * deadline that cancels a governed child run terminates the child's subprocesses
+ * too. Without it a `workflow:` node's deadline marks the child row `cancelled`
+ * while its `bash:` node keeps running to completion — the run is reported over,
+ * and the subprocess goes on mutating the checkout it was given. That is the
+ * failure the deadline exists to prevent, not a cosmetic reporting gap.
+ *
+ * A run's own top-level nodes have no parent deadline to inherit; this signal is
+ * how a deadline reaches ACROSS the run boundary that `parentDeadlineSignal`
+ * (scoped to a loop_group body inside one run) cannot cross.
+ */
+function createRunSubprocessAbortSignal(workflowRunId: string): {
+  signal: AbortSignal;
+  release: () => void;
+} {
+  const controller = new AbortController();
+  const unregister = registerProviderAbortController(workflowRunId, controller);
+  return { signal: controller.signal, release: unregister };
+}
 
 /**
  * Max validate-and-reask attempts for a `best-effort` provider whose structured
@@ -643,6 +691,170 @@ function shouldRetryNodeFailure(
   return { shouldRetry, isTransient };
 }
 
+type NodeDeadlineStore = Pick<
+  IWorkflowStore,
+  'createWorkflowNodeDeadline' | 'expireWorkflowNodeDeadline' | 'createWorkflowEvent'
+>;
+
+interface NodeDeadlineOptions<T extends NodeOutput> {
+  store: NodeDeadlineStore;
+  nodeKey: string;
+  clock?: WorkflowClock;
+  parentDeadlineSignal?: AbortSignal;
+  deadlineOutput: T;
+  onDeadlineExceeded?: () => Promise<NodeDeadlineExpiryDetails>;
+}
+
+interface NodeDeadlineExpiryDetails {
+  expiryReason?: string;
+  eventData?: Record<string, unknown>;
+  operatorMessage?: string;
+}
+
+type NodeRetryOutcome<T extends NodeOutput> =
+  | { kind: 'output'; output: T }
+  | { kind: 'deadline' }
+  | { kind: 'parent_deadline' }
+  | { kind: 'cancelled_wait' };
+
+function getGovernedNodeTimeout(node: DagNode): number | undefined {
+  if ('prompt' in node && typeof node.prompt === 'string') return node.timeout;
+  if (isLoopNode(node) || isLoopGroupNode(node)) return node.timeout;
+  if (isWorkflowNode(node)) return node.timeout;
+  return undefined;
+}
+
+function combineAbortSignals(...signals: (AbortSignal | undefined)[]): AbortSignal | undefined {
+  const present = signals.filter((signal): signal is AbortSignal => signal !== undefined);
+  if (present.length === 0) return undefined;
+  if (present.length === 1) return present[0];
+  return AbortSignal.any(present);
+}
+
+function isDeadlineExceededSignal(signal: AbortSignal | undefined): boolean {
+  return signal?.aborted === true && signal.reason === NODE_DEADLINE_EXCEEDED;
+}
+
+/**
+ * A deterministic node whose subprocess was killed by the governance deadline
+ * surfaces as an ABORT_ERR from execFile, which the generic subprocess-failure
+ * formatter would report as an ordinary bash/script error. Reporting a deadline
+ * kill as "the command failed" hides the governance decision from the audit
+ * trail and sends the operator looking for a bug in their script.
+ */
+function isDeadlineAbortFailure(
+  err: { code?: number | string },
+  signal: AbortSignal | undefined
+): boolean {
+  return err.code === 'ABORT_ERR' && isDeadlineExceededSignal(signal);
+}
+
+function waitForAbort(signal: AbortSignal, cancellation: AbortSignal): Promise<boolean> {
+  if (signal.aborted) return Promise.resolve(true);
+  if (cancellation.aborted) return Promise.resolve(false);
+
+  return new Promise(resolve => {
+    let settled = false;
+    const finish = (aborted: boolean): void => {
+      if (settled) return;
+      settled = true;
+      signal.removeEventListener('abort', onAbort);
+      cancellation.removeEventListener('abort', onCancel);
+      resolve(aborted);
+    };
+    const onAbort = (): void => {
+      finish(true);
+    };
+    const onCancel = (): void => {
+      finish(false);
+    };
+    signal.addEventListener('abort', onAbort, { once: true });
+    cancellation.addEventListener('abort', onCancel, { once: true });
+  });
+}
+
+function timestampToMs(value: Date | string, label: string): number {
+  const timestamp = value instanceof Date ? value.getTime() : Date.parse(value);
+  if (!Number.isFinite(timestamp)) {
+    throw new Error(`Invalid persisted node deadline ${label}: ${String(value)}`);
+  }
+  return timestamp;
+}
+
+async function emitNodeDeadlineExceeded<T extends NodeOutput>(
+  node: DagNode,
+  platform: IWorkflowPlatform,
+  conversationId: string,
+  workflowRun: WorkflowRun,
+  options: NodeDeadlineOptions<T>,
+  deadlineAt: number
+): Promise<T> {
+  let expiryDetails: NodeDeadlineExpiryDetails = {};
+  if (options.onDeadlineExceeded) {
+    try {
+      expiryDetails = await options.onDeadlineExceeded();
+    } catch (error) {
+      getLog().error(
+        { err: error as Error, workflowRunId: workflowRun.id, nodeKey: options.nodeKey },
+        'dag.node_deadline_cleanup_failed'
+      );
+    }
+  }
+  const expiryReason = expiryDetails.expiryReason ?? NODE_DEADLINE_EXCEEDED;
+
+  try {
+    await options.store.expireWorkflowNodeDeadline({
+      workflow_run_id: workflowRun.id,
+      node_key: options.nodeKey,
+      expiry_reason: expiryReason,
+    });
+  } catch (error) {
+    getLog().error(
+      { err: error as Error, workflowRunId: workflowRun.id, nodeKey: options.nodeKey },
+      'dag.node_deadline_expiry_persist_failed'
+    );
+  }
+
+  // Guarded like the expiry write above, and like every other createWorkflowEvent
+  // call in this file. An unguarded await here rejects the whole function, so a
+  // transient database failure would surface to runLayers as that database error
+  // instead of deadline_exceeded — the node would be reported as having failed
+  // for the wrong reason, and the operator notification below would never send.
+  try {
+    await options.store.createWorkflowEvent({
+      workflow_run_id: workflowRun.id,
+      event_type: 'node_failed',
+      step_name: options.nodeKey,
+      data: {
+        error: NODE_DEADLINE_EXCEEDED,
+        reason: NODE_DEADLINE_EXCEEDED,
+        state: 'timed_out',
+        deadline_at: new Date(deadlineAt).toISOString(),
+        ...expiryDetails.eventData,
+      },
+    });
+  } catch (error) {
+    getLog().error(
+      { err: error as Error, workflowRunId: workflowRun.id, nodeKey: options.nodeKey },
+      'dag.node_deadline_event_persist_failed'
+    );
+  }
+  getWorkflowEventEmitter().emit({
+    type: 'node_failed',
+    runId: workflowRun.id,
+    nodeId: node.id,
+    nodeName: node.command ?? node.id,
+    error: NODE_DEADLINE_EXCEEDED,
+  });
+  await safeSendMessage(
+    platform,
+    conversationId,
+    expiryDetails.operatorMessage ?? `Node '${node.id}' exceeded its absolute timeout.`,
+    { workflowId: workflowRun.id, nodeName: node.id }
+  );
+  return options.deadlineOutput;
+}
+
 /**
  * Run a node executor with the shared retry loop: exponential backoff, FATAL
  * never retried, and a platform notification before each retry. Used by both the
@@ -651,18 +863,163 @@ function shouldRetryNodeFailure(
  * `initialOutput` seeds `output` for the (unreachable) zero-iteration case and is
  * generic in `T` so callers keep their richer result type (e.g. NodeExecutionResult).
  */
-async function runNodeRetryLoop<T extends NodeOutput>(
+export async function runNodeRetryLoop<T extends NodeOutput>(
   node: DagNode,
   platform: IWorkflowPlatform,
   conversationId: string,
   workflowRun: WorkflowRun,
   retryConfig: { maxRetries: number; delayMs: number; onError: 'transient' | 'all' },
-  run: () => Promise<T>,
-  initialOutput: T
+  run: (deadlineSignal?: AbortSignal) => Promise<T>,
+  initialOutput: T,
+  deadlineOptions?: NodeDeadlineOptions<T>
 ): Promise<T> {
+  const timeout = getGovernedNodeTimeout(node);
+  const parentDeadlineSignal = deadlineOptions?.parentDeadlineSignal;
+
+  // Preserve the old path exactly for every node without deadline governance.
+  // In particular, bash/script retries still use the same timer and wording.
+  if (timeout === undefined && parentDeadlineSignal === undefined) {
+    let output = initialOutput;
+    for (let attempt = 0; attempt <= retryConfig.maxRetries; attempt++) {
+      output = await run();
+      if (output.state !== 'failed') break;
+
+      const { shouldRetry, isTransient } = shouldRetryNodeFailure(output, retryConfig.onError);
+      if (!shouldRetry || attempt >= retryConfig.maxRetries) break;
+
+      const delayMs = retryConfig.delayMs * Math.pow(2, attempt);
+      getLog().warn(
+        {
+          nodeId: node.id,
+          attempt: attempt + 1,
+          maxRetries: retryConfig.maxRetries,
+          delayMs,
+          error: output.error,
+        },
+        'dag_node_transient_retry'
+      );
+
+      const errorKind = isTransient ? 'transient error' : 'error';
+      await safeSendMessage(
+        platform,
+        conversationId,
+        `⚠️ Node \`${node.id}\` failed with ${errorKind} (attempt ${String(attempt + 1)}/${String(retryConfig.maxRetries + 1)}). Retrying in ${String(Math.round(delayMs / 1000))}s...`,
+        { workflowId: workflowRun.id, nodeName: node.id }
+      );
+
+      await new Promise(resolve => setTimeout(resolve, delayMs));
+    }
+    return output;
+  }
+
+  if (!deadlineOptions) {
+    throw new Error(`Node '${node.id}' requires deadline dependencies but none were provided.`);
+  }
+
+  const clock = deadlineOptions.clock ?? systemWorkflowClock;
+  let deadlineAt: number | undefined;
+  if (timeout !== undefined) {
+    const startedAt = clock.now();
+    const persisted = await deadlineOptions.store.createWorkflowNodeDeadline({
+      workflow_run_id: workflowRun.id,
+      node_key: deadlineOptions.nodeKey,
+      started_at: new Date(startedAt),
+      deadline_at: new Date(startedAt + timeout),
+    });
+    deadlineAt = timestampToMs(persisted.deadline_at, 'deadline_at');
+    timestampToMs(persisted.started_at, 'started_at');
+    if (persisted.expiry_reason !== null || clock.now() >= deadlineAt) {
+      return emitNodeDeadlineExceeded(
+        node,
+        platform,
+        conversationId,
+        workflowRun,
+        deadlineOptions,
+        deadlineAt
+      );
+    }
+  }
+
   let output = initialOutput;
   for (let attempt = 0; attempt <= retryConfig.maxRetries; attempt++) {
-    output = await run();
+    if (parentDeadlineSignal?.aborted) return deadlineOptions.deadlineOutput;
+    if (deadlineAt !== undefined && clock.now() >= deadlineAt) {
+      return emitNodeDeadlineExceeded(
+        node,
+        platform,
+        conversationId,
+        workflowRun,
+        deadlineOptions,
+        deadlineAt
+      );
+    }
+
+    const waitCancellation = new AbortController();
+    const ownDeadlineController = new AbortController();
+    const runSignal = combineAbortSignals(ownDeadlineController.signal, parentDeadlineSignal);
+    const outcomes: Promise<NodeRetryOutcome<T>>[] = [
+      run(runSignal).then(attemptOutput => ({ kind: 'output', output: attemptOutput })),
+    ];
+    if (deadlineAt !== undefined) {
+      const remainingMs = Math.max(0, deadlineAt - clock.now());
+      outcomes.push(
+        clock.wait(remainingMs, waitCancellation.signal).then(result => {
+          if (result === 'aborted') return { kind: 'cancelled_wait' };
+          ownDeadlineController.abort(NODE_DEADLINE_EXCEEDED);
+          return { kind: 'deadline' };
+        })
+      );
+    }
+    if (parentDeadlineSignal !== undefined) {
+      outcomes.push(
+        waitForAbort(parentDeadlineSignal, waitCancellation.signal).then(aborted =>
+          aborted ? { kind: 'parent_deadline' } : { kind: 'cancelled_wait' }
+        )
+      );
+    }
+
+    // `finally`, not a bare statement after the race. `run()` can REJECT --
+    // executeLoopNode and executeLoopGroupNode throw NODE_DEADLINE_EXCEEDED out
+    // of their `until_bash` paths, and pre-execution errors propagate the same
+    // way. On that path the race rejects, so a plain `waitCancellation.abort()`
+    // below it never runs: the deadline timer and the parent-abort listener stay
+    // live for the node's whole remaining budget, holding the event loop open
+    // and firing against a node that already finished.
+    let outcome: NodeRetryOutcome<T>;
+    try {
+      outcome = await Promise.race(outcomes);
+    } finally {
+      waitCancellation.abort();
+    }
+    if (outcome.kind === 'deadline') {
+      if (deadlineAt === undefined) {
+        throw new Error(`Node '${node.id}' reached a deadline without a persisted deadline.`);
+      }
+      return emitNodeDeadlineExceeded(
+        node,
+        platform,
+        conversationId,
+        workflowRun,
+        deadlineOptions,
+        deadlineAt
+      );
+    }
+    if (outcome.kind === 'parent_deadline') return deadlineOptions.deadlineOutput;
+    if (outcome.kind === 'cancelled_wait') {
+      throw new Error(`Node '${node.id}' deadline wait ended without an execution outcome.`);
+    }
+    if (parentDeadlineSignal?.aborted) return deadlineOptions.deadlineOutput;
+    if (deadlineAt !== undefined && clock.now() >= deadlineAt) {
+      return emitNodeDeadlineExceeded(
+        node,
+        platform,
+        conversationId,
+        workflowRun,
+        deadlineOptions,
+        deadlineAt
+      );
+    }
+    output = outcome.output;
     if (output.state !== 'failed') break;
 
     const { shouldRetry, isTransient } = shouldRetryNodeFailure(output, retryConfig.onError);
@@ -688,7 +1045,37 @@ async function runNodeRetryLoop<T extends NodeOutput>(
       { workflowId: workflowRun.id, nodeName: node.id }
     );
 
-    await new Promise(resolve => setTimeout(resolve, delayMs));
+    if (parentDeadlineSignal?.aborted) return deadlineOptions.deadlineOutput;
+    if (deadlineAt === undefined) {
+      const result = await clock.wait(delayMs, parentDeadlineSignal);
+      if (result === 'aborted') return deadlineOptions.deadlineOutput;
+      continue;
+    }
+
+    const remainingMs = deadlineAt - clock.now();
+    if (remainingMs <= 0) {
+      return emitNodeDeadlineExceeded(
+        node,
+        platform,
+        conversationId,
+        workflowRun,
+        deadlineOptions,
+        deadlineAt
+      );
+    }
+    const waitMs = Math.min(delayMs, remainingMs);
+    const waitResult = await clock.wait(waitMs, parentDeadlineSignal);
+    if (waitResult === 'aborted') return deadlineOptions.deadlineOutput;
+    if (waitMs === remainingMs) {
+      return emitNodeDeadlineExceeded(
+        node,
+        platform,
+        conversationId,
+        workflowRun,
+        deadlineOptions,
+        deadlineAt
+      );
+    }
   }
   return output;
 }
@@ -1303,7 +1690,8 @@ async function executeNodeInternal(
   resolvedTier?: TierName,
   resolvedEffort?: string,
   stepNamePrefix = '',
-  iteration?: number
+  iteration?: number,
+  governanceDeadlineSignal?: AbortSignal
 ): Promise<NodeExecutionResult> {
   const nodeStartTime = Date.now();
   const nodeContext: SendMessageContext = { workflowId: workflowRun.id, nodeName: node.id };
@@ -1463,7 +1851,7 @@ async function executeNodeInternal(
   const shouldForkSession = resumeSessionId !== undefined;
   const nodeOptionsWithAbort: SendQueryOptions | undefined = {
     ...nodeOptions,
-    abortSignal: nodeAbortController.signal,
+    abortSignal: combineAbortSignals(nodeAbortController.signal, governanceDeadlineSignal),
     ...(shouldForkSession ? { forkSession: true } : {}),
   };
   let nodeIdleTimedOut = false;
@@ -2105,6 +2493,10 @@ async function executeNodeInternal(
     }
   };
 
+  const unregisterProviderAbortController = registerProviderAbortController(
+    workflowRun.id,
+    nodeAbortController
+  );
   try {
     // Validate-and-reask loop. Enforced / non-output_format nodes run exactly once
     // (maxReasks = 0). A best-effort node whose structured output is missing or
@@ -2216,6 +2608,19 @@ async function executeNodeInternal(
     }
 
     // Only post "completed via idle timeout" when output exists — zero-output timeout falls through to the empty-output guard below.
+    if (isDeadlineExceededSignal(governanceDeadlineSignal)) {
+      // Clean up throttle entries
+      lastNodeCancelCheck.delete(`${workflowRun.id}:${node.id}`);
+      lastNodeActivityUpdate.delete(`${workflowRun.id}:${node.id}`);
+      return {
+        state: 'failed',
+        output: nodeOutputText,
+        error: NODE_DEADLINE_EXCEEDED,
+        costUsd: nodeCostUsd,
+        ...(nodeTokens !== undefined ? { tokens: nodeTokens } : {}),
+      };
+    }
+
     if (nodeIdleTimedOut && (nodeOutputText.trim() !== '' || structuredOutput !== undefined)) {
       getLog().warn(
         { nodeId: node.id, timeoutMs: effectiveIdleTimeout },
@@ -2231,6 +2636,18 @@ async function executeNodeInternal(
 
     // If cancelled during streaming (not idle timeout), return as failed with cancel reason
     if (nodeAbortController.signal.aborted && !nodeIdleTimedOut) {
+      if (isDeadlineExceededSignal(governanceDeadlineSignal)) {
+        // Clean up throttle entries
+        lastNodeCancelCheck.delete(`${workflowRun.id}:${node.id}`);
+        lastNodeActivityUpdate.delete(`${workflowRun.id}:${node.id}`);
+        return {
+          state: 'failed',
+          output: nodeOutputText,
+          error: NODE_DEADLINE_EXCEEDED,
+          costUsd: nodeCostUsd,
+          ...(nodeTokens !== undefined ? { tokens: nodeTokens } : {}),
+        };
+      }
       const duration = Date.now() - nodeStartTime;
       getLog().info(
         { nodeId: node.id, durationMs: duration },
@@ -2421,6 +2838,16 @@ async function executeNodeInternal(
     lastNodeCancelCheck.delete(`${workflowRun.id}:${node.id}`);
     lastNodeActivityUpdate.delete(`${workflowRun.id}:${node.id}`);
 
+    if (isDeadlineExceededSignal(governanceDeadlineSignal)) {
+      return {
+        state: 'failed',
+        output: nodeOutputText,
+        error: NODE_DEADLINE_EXCEEDED,
+        costUsd: nodeCostUsd,
+        ...(nodeTokens !== undefined ? { tokens: nodeTokens } : {}),
+      };
+    }
+
     // If the abort was triggered by user cancel (not idle timeout), classify as cancel
     if (nodeAbortController.signal.aborted && !nodeIdleTimedOut) {
       getLog().info({ nodeId: node.id }, 'dag_node_cancelled_via_abort');
@@ -2465,6 +2892,8 @@ async function executeNodeInternal(
       costUsd: nodeCostUsd,
       ...(nodeTokens !== undefined ? { tokens: nodeTokens } : {}),
     };
+  } finally {
+    unregisterProviderAbortController();
   }
 }
 
@@ -2523,19 +2952,31 @@ async function runSubprocess(
   execContext: ExecutionContext,
   cmd: string,
   args: string[],
-  options: { cwd: string; timeout: number; env: NodeJS.ProcessEnv }
+  options: { cwd: string; timeout: number; env: NodeJS.ProcessEnv; signal?: AbortSignal }
 ): Promise<{ stdout: string; stderr: string }> {
   if (execContext.kind === 'container') {
     const dockerArgs = buildSubprocessDockerArgs(execContext, cmd, args, {
       cwd: options.cwd,
       env: options.env,
     });
-    return execFileAsync('docker', dockerArgs, { timeout: options.timeout });
+    // The signal reaches the local `docker exec` CLIENT, not the process it
+    // started inside the container: docker does not forward the client's death
+    // as a signal to the in-container process, so that process can outlive the
+    // abort and keep mutating the mounted checkout after the node reports
+    // `deadline_exceeded`. This is not a regression from the deadline work --
+    // `timeout` below has always killed the same client process and nothing
+    // more. Closing it needs the in-container pid, which `docker exec` does not
+    // hand back; that is a container-backend change, not a dispatch-site one.
+    return execFileAsync('docker', dockerArgs, {
+      timeout: options.timeout,
+      signal: options.signal,
+    });
   }
   return execFileAsync(cmd, args, {
     cwd: options.cwd,
     timeout: options.timeout,
     env: { ...process.env, ...options.env },
+    signal: options.signal,
   });
 }
 
@@ -2608,7 +3049,8 @@ async function executeBashNode(
   envVars?: Record<string, string>,
   stepNamePrefix = '',
   iteration?: number,
-  execContext: ExecutionContext = { kind: 'host' }
+  execContext: ExecutionContext = { kind: 'host' },
+  deadlineSignal?: AbortSignal
 ): Promise<NodeOutput> {
   const nodeStartTime = Date.now();
   const nodeContext: SendMessageContext = { workflowId: workflowRun.id, nodeName: node.id };
@@ -2696,6 +3138,7 @@ async function executeBashNode(
       cwd,
       timeout,
       env: subprocessEnv,
+      signal: deadlineSignal,
     });
 
     // Trim trailing newline from stdout (common shell behavior)
@@ -2754,13 +3197,16 @@ async function executeBashNode(
   } catch (error) {
     const err = error as Error & { killed?: boolean; code?: number | string; stderr?: string };
     const isTimeout = err.killed === true || (err.message ?? '').includes('timed out');
+    const deadlineKilled = isDeadlineAbortFailure(err, deadlineSignal);
     const label = `Bash node '${node.id}'`;
     // Always run the formatter so logs get sanitized fields regardless of which
     // user-facing branch we end up in — the timeout message also contains the
     // full `Command failed: bash -c <body>` line and would otherwise leak.
     const formatted = formatSubprocessFailure(err, label);
     let errorMsg: string;
-    if (isTimeout) {
+    if (deadlineKilled) {
+      errorMsg = NODE_DEADLINE_EXCEEDED;
+    } else if (isTimeout) {
       errorMsg = `${label} timed out after ${String(timeout)}ms`;
     } else if (err.code === 'ENOENT' || err.code === 'ENOTDIR') {
       errorMsg =
@@ -2876,7 +3322,8 @@ async function executeScriptNode(
   // env (never spliced into source — #2115). '' for top-level scripts and non-first
   // iterations (mirrors executeBashNode, which delivers loop input via quoted splice).
   loopUserInput = '',
-  execContext: ExecutionContext = { kind: 'host' }
+  execContext: ExecutionContext = { kind: 'host' },
+  deadlineSignal?: AbortSignal
 ): Promise<NodeOutput> {
   const nodeStartTime = Date.now();
   const nodeContext: SendMessageContext = { workflowId: workflowRun.id, nodeName: node.id };
@@ -3075,6 +3522,7 @@ async function executeScriptNode(
       cwd,
       timeout,
       env: subprocessEnv,
+      signal: deadlineSignal,
     });
 
     // Trim trailing newline from stdout (common shell behavior)
@@ -3121,12 +3569,15 @@ async function executeScriptNode(
     const err = error as Error & { killed?: boolean; code?: number | string; stderr?: string };
     const isTimeout = err.killed === true || (err.message ?? '').includes('timed out');
     const label = `Script node '${node.id}'`;
+    const deadlineKilled = isDeadlineAbortFailure(err, deadlineSignal);
     // Always run the formatter so logs get sanitized fields regardless of which
     // user-facing branch we end up in — the timeout message also contains the
     // full `Command failed: bun -e <body>` line and would otherwise leak.
     const formatted = formatSubprocessFailure(err, label);
     let errorMsg: string;
-    if (isTimeout) {
+    if (deadlineKilled) {
+      errorMsg = NODE_DEADLINE_EXCEEDED;
+    } else if (isTimeout) {
       errorMsg = `${label} timed out after ${String(timeout)}ms`;
     } else if (err.message?.includes('ENOENT')) {
       errorMsg = `${label} failed: '${cmd}' executable not found in PATH`;
@@ -3343,7 +3794,8 @@ async function executeLoopGroupNode(
   issueContext?: string,
   stepNamePrefix = '',
   execContext: ExecutionContext = { kind: 'host' },
-  runChildWorkflow?: RunChildWorkflowFn
+  runChildWorkflow?: RunChildWorkflowFn,
+  governanceDeadlineSignal?: AbortSignal
 ): Promise<NodeExecutionResult> {
   const group = node.loop_group;
   const msgContext = { workflowId: workflowRun.id, nodeName: node.id };
@@ -3427,6 +3879,9 @@ async function executeLoopGroupNode(
   };
 
   for (let i = startIteration; i <= group.max_iterations; i++) {
+    if (isDeadlineExceededSignal(governanceDeadlineSignal)) {
+      return { state: 'failed', output: lastIterationOutput, error: NODE_DEADLINE_EXCEEDED };
+    }
     const iterationStart = Date.now();
 
     // Between-iteration status check (paused tolerated — mirrors executeLoopNode).
@@ -3546,8 +4001,29 @@ async function executeLoopGroupNode(
       // Deliver this iteration's approval-gate free-text to body script: nodes via env
       // (never spliced into source — #2115); matches applyLoopPrevToBodyNode's skip.
       bodyLoopUserInput: userInputForIter,
+      parentDeadlineSignal: governanceDeadlineSignal,
     };
     await runLayers(iterCtx);
+    // Fold this iteration's usage BEFORE the deadline check. The iteration ran and
+    // was billed; returning above the accumulation below would under-report spend
+    // on exactly the path a governance feature exists to account for.
+    loopTotalCostUsd = (loopTotalCostUsd ?? 0) + iterCtx.totalCostUsd;
+    if (iterCtx.totalTokensIn > 0 || iterCtx.totalTokensOut > 0) {
+      loopTotalTokens = {
+        input: (loopTotalTokens?.input ?? 0) + iterCtx.totalTokensIn,
+        output: (loopTotalTokens?.output ?? 0) + iterCtx.totalTokensOut,
+      };
+    }
+    if (isDeadlineExceededSignal(governanceDeadlineSignal)) {
+      return {
+        state: 'failed',
+        output: lastIterationOutput,
+        error: NODE_DEADLINE_EXCEEDED,
+        costUsd: loopTotalCostUsd,
+        ...(loopTotalTokens !== undefined ? { tokens: loopTotalTokens } : {}),
+        loopIterations: i,
+      };
+    }
     // A body approval/cancel node may have paused or cancelled the run mid-iteration.
     // `paused` is tolerated (a sibling gate in the same iteration layer) — mirror
     // executeLoopNode's between-iteration tolerance — but a terminal/cancelled state
@@ -3562,14 +4038,6 @@ async function executeLoopGroupNode(
         'loop_group_node.post_body_stop'
       );
       return { state: 'failed', output: lastIterationOutput, error: `Workflow ${effectiveStatus}` };
-    }
-    // Accumulate usage across iterations (charged on the failure path below too).
-    loopTotalCostUsd = (loopTotalCostUsd ?? 0) + iterCtx.totalCostUsd;
-    if (iterCtx.totalTokensIn > 0 || iterCtx.totalTokensOut > 0) {
-      loopTotalTokens = {
-        input: (loopTotalTokens?.input ?? 0) + iterCtx.totalTokensIn,
-        output: (loopTotalTokens?.output ?? 0) + iterCtx.totalTokensOut,
-      };
     }
 
     // A failed body node fails the group immediately — mirrors the top-level DAG
@@ -3676,10 +4144,23 @@ async function executeLoopGroupNode(
             EXTERNAL_CONTEXT: issueContext ?? '',
             ISSUE_CONTEXT: issueContext ?? '',
           },
+          signal: governanceDeadlineSignal,
         });
         bashComplete = true;
       } catch (e) {
         const bashErr = e as NodeJS.ErrnoException;
+        // The deadline killed this subprocess. It must be checked FIRST: an aborted
+        // command exits non-zero, and the numeric-exit branch below reads that as
+        // "condition not met yet, keep looping" — which would spin the loop past
+        // its own deadline. Returning the deadline error routes the node through
+        // the same terminal path as every other deadline exit.
+        if (isDeadlineExceededSignal(governanceDeadlineSignal)) {
+          getLog().error(
+            { nodeId: node.id, iteration: i },
+            'loop_group.until_bash_deadline_exceeded'
+          );
+          throw new Error(NODE_DEADLINE_EXCEEDED);
+        }
         // System-level errors (ENOENT/EACCES/ENOTDIR) mean the bash binary itself
         // is unreachable — looping forever on bashComplete=false is wrong. Throw
         // out of the group with a clear actionable error instead (mirrors
@@ -3707,6 +4188,17 @@ async function executeLoopGroupNode(
         // Numeric exit code from the bash script = condition not met yet, keep looping.
         bashComplete = false;
       }
+    }
+
+    if (isDeadlineExceededSignal(governanceDeadlineSignal)) {
+      return {
+        state: 'failed',
+        output: lastIterationOutput,
+        error: NODE_DEADLINE_EXCEEDED,
+        costUsd: loopTotalCostUsd,
+        ...(loopTotalTokens !== undefined ? { tokens: loopTotalTokens } : {}),
+        loopIterations: i,
+      };
     }
 
     const duration = Date.now() - iterationStart;
@@ -4032,7 +4524,8 @@ async function executeLoopNode(
   execContext: ExecutionContext = { kind: 'host' },
   resolvedModel?: string,
   resolvedTier?: TierName,
-  resolvedEffort?: string
+  resolvedEffort?: string,
+  governanceDeadlineSignal?: AbortSignal
 ): Promise<NodeExecutionResult> {
   const loop = node.loop;
   const msgContext = { workflowId: workflowRun.id, nodeName: node.id };
@@ -4268,6 +4761,17 @@ async function executeLoopNode(
   };
 
   for (let i = startIteration; i <= loop.max_iterations; i++) {
+    if (isDeadlineExceededSignal(governanceDeadlineSignal)) {
+      // Route through failLoopNode like every other terminal exit. The node has
+      // already emitted node_started, so returning directly would end its audit
+      // trail mid-flight with no node_failed row.
+      return failLoopNode(NODE_DEADLINE_EXCEEDED, {
+        output: lastIterationOutput,
+        ...(loopTotalCostUsd !== undefined ? { costUsd: loopTotalCostUsd } : {}),
+        ...(loopTotalTokens !== undefined ? { tokens: loopTotalTokens } : {}),
+        loopIterations: i - 1,
+      });
+    }
     const iterationStart = Date.now();
 
     // Check for non-running status between iterations. `paused` is tolerated
@@ -4367,6 +4871,10 @@ async function executeLoopNode(
       }
     };
 
+    const unregisterProviderAbortController = registerProviderAbortController(
+      workflowRun.id,
+      iterationAbortController
+    );
     try {
       // Build prompt — substituteWorkflowVariables throws if $BASE_BRANCH referenced but empty
       // Pass loopUserInput on the first resumed iteration; '' on all others (non-interactive
@@ -4392,7 +4900,7 @@ async function executeLoopNode(
 
       const iterationOptions: SendQueryOptions | undefined = {
         ...resolvedOptions,
-        abortSignal: iterationAbortController.signal,
+        abortSignal: combineAbortSignals(iterationAbortController.signal, governanceDeadlineSignal),
       };
 
       const generator = aiClient.sendQuery(finalPrompt, cwd, resumeSessionId, iterationOptions);
@@ -4691,6 +5199,15 @@ async function executeLoopNode(
       }
       foldIterationUsage();
 
+      if (isDeadlineExceededSignal(governanceDeadlineSignal)) {
+        return await failLoopNode(NODE_DEADLINE_EXCEEDED, {
+          output: cleanOutput,
+          ...(loopTotalCostUsd !== undefined ? { costUsd: loopTotalCostUsd } : {}),
+          ...(loopTotalTokens !== undefined ? { tokens: loopTotalTokens } : {}),
+          loopIterations: i,
+        });
+      }
+
       // Stream ended with background tasks still live (idle timeout mid-wait or
       // subprocess death): their artifacts may be missing — record the
       // incompleteness (surfaced on the node_completed event) and warn loudly
@@ -4727,6 +5244,16 @@ async function executeLoopNode(
       // iteration — mirrors both the AI-node 'Cancelled by user' return and
       // this loop's own between-iteration stop path.
       if (iterationAbortController.signal.aborted && !iterationIdleTimedOut) {
+        if (isDeadlineExceededSignal(governanceDeadlineSignal)) {
+          return {
+            state: 'failed',
+            output: cleanOutput,
+            error: NODE_DEADLINE_EXCEEDED,
+            costUsd: loopTotalCostUsd,
+            ...(loopTotalTokens !== undefined ? { tokens: loopTotalTokens } : {}),
+            loopIterations: i,
+          };
+        }
         const effectiveStatus = streamStopStatus ?? 'cancelled';
         await safeSendMessage(
           platform,
@@ -4743,6 +5270,16 @@ async function executeLoopNode(
       }
     } catch (error) {
       foldIterationUsage();
+      if (isDeadlineExceededSignal(governanceDeadlineSignal)) {
+        return {
+          state: 'failed',
+          output: cleanOutput,
+          error: NODE_DEADLINE_EXCEEDED,
+          costUsd: loopTotalCostUsd,
+          ...(loopTotalTokens !== undefined ? { tokens: loopTotalTokens } : {}),
+          loopIterations: i,
+        };
+      }
       const err = error as Error;
       const duration = Date.now() - iterationStart;
       getLog().error({ err, nodeId: node.id, iteration: i }, 'loop_node.iteration_failed');
@@ -4763,12 +5300,14 @@ async function executeLoopNode(
         .catch((evtErr: Error) => {
           logEventStoreError(evtErr, i);
         });
-      return failLoopNode(`Loop iteration ${i} failed: ${err.message}`, {
+      return await failLoopNode(`Loop iteration ${i} failed: ${err.message}`, {
         costUsd: loopTotalCostUsd,
         ...(loopTotalTokens !== undefined ? { tokens: loopTotalTokens } : {}),
         loopIterations: i,
         data: { iteration: i },
       });
+    } finally {
+      unregisterProviderAbortController();
     }
 
     // Notify on idle timeout
@@ -4889,10 +5428,20 @@ async function executeLoopNode(
             EXTERNAL_CONTEXT: issueContext ?? '',
             ISSUE_CONTEXT: issueContext ?? '',
           },
+          signal: governanceDeadlineSignal,
         });
         bashComplete = true; // exit 0 = complete
       } catch (e) {
         const bashErr = e as NodeJS.ErrnoException;
+        // The deadline killed this subprocess. It must be checked FIRST: an aborted
+        // command exits non-zero, and the numeric-exit branch below reads that as
+        // "condition not met yet, keep looping" — which would spin the loop past
+        // its own deadline. Returning the deadline error routes the node through
+        // the same terminal path as every other deadline exit.
+        if (isDeadlineExceededSignal(governanceDeadlineSignal)) {
+          getLog().error({ nodeId: node.id, iteration: i }, 'loop.until_bash_deadline_exceeded');
+          throw new Error(NODE_DEADLINE_EXCEEDED);
+        }
         // System-level errors (ENOENT/EACCES/ENOTDIR) mean the bash binary itself
         // is unreachable — looping forever on bashComplete=false is wrong. Throw
         // out of the loop with a clear actionable error instead.
@@ -5369,6 +5918,116 @@ async function executeApprovalNode(
   return { state: 'completed' as const, output: '' };
 }
 
+interface WorkflowNodeDeadlineCleanup {
+  captureChildRunId(childRunId: string): void;
+  recordInitialChildren(children: readonly WorkflowRun[]): void;
+  onDeadlineExceeded: () => Promise<NodeDeadlineExpiryDetails>;
+}
+
+function workflowDeadlineUnconfirmedMessage(childRunId: string): string {
+  return (
+    `Sub-run ${childRunId} may still be running. ` +
+    `Check with \`archon workflow status ${childRunId}\` and abandon it with ` +
+    `\`archon workflow abandon ${childRunId}\` if it is orphaned.`
+  );
+}
+
+function createWorkflowNodeDeadlineCleanup(
+  node: WorkflowNode,
+  ctx: RunLayersContext
+): WorkflowNodeDeadlineCleanup {
+  const { deps, workflowRun: parentRun } = ctx;
+  const rawApproval = parentRun.metadata?.approval;
+  const approval = isApprovalContext(rawApproval) ? rawApproval : undefined;
+  let exactChildRunId =
+    approval?.type === 'child_workflow' &&
+    approval.nodeId === node.id &&
+    typeof approval.childRunId === 'string' &&
+    approval.childRunId.length > 0
+      ? approval.childRunId
+      : undefined;
+  let initialChildIds: ReadonlySet<string> | undefined;
+
+  const matchingChildren = (children: readonly WorkflowRun[]): WorkflowRun[] =>
+    children.filter(
+      child =>
+        readSubrunMetadata(child.metadata as Record<string, unknown> | undefined).parentNodeId ===
+        node.id
+    );
+
+  const unconfirmed = (childRunId?: string): NodeDeadlineExpiryDetails => {
+    const operatorMessage = childRunId
+      ? workflowDeadlineUnconfirmedMessage(childRunId)
+      : 'The sub-run ID was not available when the wrapper deadline expired. ' +
+        'It may still be running. Check active runs with `archon workflow status` and abandon ' +
+        'an orphaned child with `archon workflow abandon <id>`.';
+    return {
+      expiryReason: NODE_DEADLINE_CLEANUP_UNCONFIRMED,
+      eventData: {
+        type: 'workflow',
+        cleanup: 'unconfirmed',
+        ...(childRunId ? { child_run_id: childRunId } : {}),
+        message: operatorMessage,
+      },
+      operatorMessage,
+    };
+  };
+
+  return {
+    captureChildRunId(childRunId): void {
+      if (childRunId.length > 0) exactChildRunId = childRunId;
+    },
+    recordInitialChildren(children): void {
+      const matches = matchingChildren(children);
+      initialChildIds = new Set(matches.map(child => child.id));
+      if (exactChildRunId === undefined && matches.length === 1) {
+        exactChildRunId = matches[0].id;
+      }
+    },
+    onDeadlineExceeded: async (): Promise<NodeDeadlineExpiryDetails> => {
+      let childRunId = exactChildRunId;
+
+      // A fresh child row may be created after executeWorkflowNode's initial
+      // re-entry lookup but before the deadline fires. Identify it only when it
+      // is the sole new child for this exact parent node. Multiple candidates
+      // are ambiguous, so never choose the newest one for cancellation.
+      if (childRunId === undefined && initialChildIds !== undefined) {
+        try {
+          const children = matchingChildren(await deps.store.findChildRuns(parentRun.id));
+          const newlyCreated = children.filter(child => !initialChildIds?.has(child.id));
+          if (newlyCreated.length === 1) childRunId = newlyCreated[0].id;
+        } catch (error) {
+          getLog().error(
+            { err: error as Error, parentRunId: parentRun.id, nodeId: node.id },
+            'workflow.wrapper_deadline_child_lookup_failed'
+          );
+        }
+      }
+
+      if (childRunId === undefined) return unconfirmed();
+
+      abortInFlightProviderWork(childRunId);
+      try {
+        const { cancelled } = await deps.store.cancelWorkflowRun(childRunId);
+        if (!cancelled) return unconfirmed(childRunId);
+      } catch (error) {
+        getLog().error(
+          { err: error as Error, parentRunId: parentRun.id, nodeId: node.id, childRunId },
+          'workflow.wrapper_deadline_cancel_failed'
+        );
+        return unconfirmed(childRunId);
+      }
+
+      return {
+        eventData: {
+          type: 'workflow',
+          child_run_id: childRunId,
+        },
+      };
+    },
+  };
+}
+
 /**
  * Execute a `workflow:` (sub-run) node (#2121 Phase 2). Starts — or, on parent
  * resume, re-inspects — a CHILD workflow run and threads its terminal output back
@@ -5384,10 +6043,17 @@ async function executeApprovalNode(
  */
 async function executeWorkflowNode(
   node: WorkflowNode,
-  ctx: RunLayersContext
+  ctx: RunLayersContext,
+  deadlineSignal?: AbortSignal,
+  deadlineCleanup?: WorkflowNodeDeadlineCleanup
 ): Promise<NodeExecutionResult> {
   const { deps, platform, conversationId, cwd, workflowRun: parentRun } = ctx;
   const msgContext = { workflowId: parentRun.id, nodeName: node.id };
+  const deadlineResult = (): NodeExecutionResult => ({
+    state: 'failed',
+    output: '',
+    error: NODE_DEADLINE_EXCEEDED,
+  });
 
   // Build the failed result AND persist a node_failed event with the reason. Unlike
   // command/prompt/bash/script nodes (which write their own node_failed inside their
@@ -5396,6 +6062,7 @@ async function executeWorkflowNode(
   // unknown target, cancelled child, …) would be swallowed into the run-level DAG
   // summary and never auditable per-node. Fire-and-forget like every other event.
   const failResult = (error: string): NodeExecutionResult => {
+    if (isDeadlineExceededSignal(deadlineSignal)) return deadlineResult();
     deps.store
       .createWorkflowEvent({
         workflow_run_id: parentRun.id,
@@ -5498,6 +6165,7 @@ async function executeWorkflowNode(
   // branch — so the resume snapshot skips a truly-finished sub-run on resume
   // but re-runs one still blocked on its child.
   const asCompleted = (outcome: ChildWorkflowOutcome): NodeExecutionResult => {
+    if (isDeadlineExceededSignal(deadlineSignal)) return deadlineResult();
     if (outcome.output === undefined) {
       // A completed child with no non-blank terminal output threads '' into
       // $<node>.output — legal, but indistinguishable downstream from an
@@ -5567,6 +6235,8 @@ async function executeWorkflowNode(
   // itself (metadata.approval), and there is no human decision to audit for a
   // gate that resolves automatically on child completion.
   const pauseParentOnChild = async (childRunId: string): Promise<NodeExecutionResult> => {
+    deadlineCleanup?.captureChildRunId(childRunId);
+    if (isDeadlineExceededSignal(deadlineSignal)) return deadlineResult();
     // KNOWN LIMITATION (#2180): the run has a SINGLE approval-gate slot. If two
     // gate-pausing nodes (two `workflow:` children, or a `workflow:` + an `approval:`)
     // land in the SAME topological layer, the second pauseWorkflowRun matches 0 rows
@@ -5600,6 +6270,8 @@ async function executeWorkflowNode(
   };
 
   const interpret = async (outcome: ChildWorkflowOutcome): Promise<NodeExecutionResult> => {
+    deadlineCleanup?.captureChildRunId(outcome.childRunId);
+    if (isDeadlineExceededSignal(deadlineSignal)) return deadlineResult();
     switch (outcome.status) {
       case 'completed':
         return asCompleted(outcome);
@@ -5625,13 +6297,18 @@ async function executeWorkflowNode(
   // several, the most recent wins.
   let existing: WorkflowRun | undefined;
   try {
-    const children = (await deps.store.findChildRuns(parentRun.id)).filter(
+    if (isDeadlineExceededSignal(deadlineSignal)) return deadlineResult();
+    const allChildren = await deps.store.findChildRuns(parentRun.id);
+    deadlineCleanup?.recordInitialChildren(allChildren);
+    if (isDeadlineExceededSignal(deadlineSignal)) return deadlineResult();
+    const children = allChildren.filter(
       c =>
         readSubrunMetadata(c.metadata as Record<string, unknown> | undefined).parentNodeId ===
         node.id
     );
     existing = children.length > 0 ? children[children.length - 1] : undefined;
   } catch (err) {
+    if (isDeadlineExceededSignal(deadlineSignal)) return deadlineResult();
     return failResult(
       `Failed to look up child runs for node '${node.id}': ${(err as Error).message}`
     );
@@ -5652,9 +6329,11 @@ async function executeWorkflowNode(
   };
 
   try {
+    if (isDeadlineExceededSignal(deadlineSignal)) return deadlineResult();
     if (existing === undefined) {
       return await interpret(await ctx.runChildWorkflow(childArgs));
     }
+    if (isDeadlineExceededSignal(deadlineSignal)) return deadlineResult();
     if (existing.status === 'failed') {
       // Resume-through-parent recovery (D5/#1764): re-drive the failed child once.
       return await interpret(
@@ -5674,6 +6353,7 @@ async function executeWorkflowNode(
     // freshly-run child uses (interpret handles both).
     return await interpret(childOutcomeFromRun(existing));
   } catch (err) {
+    if (isDeadlineExceededSignal(deadlineSignal)) return deadlineResult();
     return failResult(`Sub-run '${node.workflow}' errored: ${(err as Error).message}`);
   }
 }
@@ -6620,6 +7300,8 @@ interface RunLayersContext {
    * undefined for the top-level DAG (top-level scripts have no loop user input).
    */
   bodyLoopUserInput?: string;
+  /** Absolute deadline inherited from an enclosing loop_group. */
+  parentDeadlineSignal?: AbortSignal;
 }
 
 /**
@@ -6633,6 +7315,25 @@ interface RunLayersContext {
  * Shared by the top-level DAG and `executeLoopGroupNode`'s per-iteration body execution.
  */
 async function runLayers(ctx: RunLayersContext): Promise<void> {
+  // Deterministic subprocesses of THIS run, abortable by run id.
+  //
+  // `ctx.parentDeadlineSignal` only reaches a loop_group body inside one run; it
+  // cannot cross a run boundary, so a governed child run's own bash nodes have
+  // no signal at all. Registering here puts them in the same per-run registry a
+  // wrapper deadline already aborts, which is what makes cancelling a child run
+  // actually stop the child's work rather than only relabel its database row.
+  const runSubprocessAbort = createRunSubprocessAbortSignal(ctx.workflowRun.id);
+  try {
+    await runLayersInner(ctx, runSubprocessAbort.signal);
+  } finally {
+    runSubprocessAbort.release();
+  }
+}
+
+async function runLayersInner(
+  ctx: RunLayersContext,
+  runSubprocessSignal: AbortSignal
+): Promise<void> {
   const {
     deps,
     platform,
@@ -6661,12 +7362,22 @@ async function runLayers(ctx: RunLayersContext): Promise<void> {
     priorCompletedNodes,
     stepNamePrefix,
     iteration,
+    parentDeadlineSignal,
   } = ctx;
   // nodeOutputs + accumulators + lastSequentialSession are mutated in place on `ctx`.
 
   for (let layerIdx = 0; layerIdx < layers.length; layerIdx++) {
     const layer = layers[layerIdx];
     const isParallelLayer = layer.length > 1;
+
+    // Check if the governance deadline has fired before dispatching this layer.
+    // An aborted deadline signal does not change the run's status, so the between-layer
+    // status check below does not see it. We must check the signal directly here to stop
+    // layer dispatch early when the deadline is already exceeded.
+    if (isDeadlineExceededSignal(parentDeadlineSignal)) {
+      getLog().info({ layerIdx, totalLayers: layers.length }, 'dag.layer_skipped_deadline');
+      return;
+    }
 
     if (isParallelLayer) {
       ctx.lastSequentialSession = undefined; // reset — parallel nodes can't share sessions
@@ -6898,7 +7609,8 @@ async function runLayers(ctx: RunLayersContext): Promise<void> {
                   config.envVars,
                   stepNamePrefix,
                   iteration,
-                  execContext
+                  execContext,
+                  combineAbortSignals(ctx.parentDeadlineSignal, runSubprocessSignal)
                 )
             );
             return { nodeId: node.id, output };
@@ -6927,29 +7639,60 @@ async function runLayers(ctx: RunLayersContext): Promise<void> {
               execContext
             );
 
-            const output = await executeLoopNode(
-              deps,
+            const deadlineOutput: NodeExecutionResult = {
+              state: 'failed',
+              output: '',
+              error: NODE_DEADLINE_EXCEEDED,
+            };
+            const initialOutput: NodeExecutionResult = {
+              state: 'failed',
+              output: '',
+              error: 'Node did not execute',
+            };
+            const output = await runNodeRetryLoop(
+              node,
               platform,
               conversationId,
-              cwd,
               workflowRun,
-              node,
-              loopProvider,
-              loopOptions,
-              artifactsDir,
-              stateDir,
-              logDir,
-              baseBranch,
-              docsDir,
-              ctx.nodeOutputs,
-              config,
-              issueContext,
-              configuredCommandFolder,
-              stepNamePrefix,
-              execContext,
-              resolvedLoopModel,
-              resolvedLoopTier,
-              resolvedLoopEffort
+              NO_NODE_RETRIES,
+              deadlineSignal =>
+                executeLoopNode(
+                  deps,
+                  platform,
+                  conversationId,
+                  cwd,
+                  workflowRun,
+                  node,
+                  loopProvider,
+                  loopOptions,
+                  artifactsDir,
+                  stateDir,
+                  logDir,
+                  baseBranch,
+                  docsDir,
+                  ctx.nodeOutputs,
+                  config,
+                  issueContext,
+                  configuredCommandFolder,
+                  stepNamePrefix,
+                  execContext,
+                  resolvedLoopModel,
+                  resolvedLoopTier,
+                  resolvedLoopEffort,
+                  // The loop's own `until_bash` is a deterministic subprocess, so it
+                  // needs the run signal for the same reason the bash/script sites do:
+                  // a wrapper deadline that cancels this run must reach the shell it
+                  // started, not just the row that records it.
+                  combineAbortSignals(deadlineSignal, runSubprocessSignal)
+                ),
+              initialOutput,
+              {
+                store: deps.store,
+                nodeKey: stepNamePrefix + node.id,
+                clock: deps.clock,
+                parentDeadlineSignal,
+                deadlineOutput,
+              }
             );
             // Loop nodes run every iteration on the same resolved provider, so the
             // result session (if any) is attributable to loopProvider — tag it so a
@@ -6979,29 +7722,58 @@ async function runLayers(ctx: RunLayersContext): Promise<void> {
               execContext
             );
 
-            const output = await executeLoopGroupNode(
-              deps,
+            const deadlineOutput: NodeExecutionResult = {
+              state: 'failed',
+              output: '',
+              error: NODE_DEADLINE_EXCEEDED,
+            };
+            const initialOutput: NodeExecutionResult = {
+              state: 'failed',
+              output: '',
+              error: 'Node did not execute',
+            };
+            const output = await runNodeRetryLoop(
+              node,
               platform,
               conversationId,
-              cwd,
               workflowRun,
-              node,
-              loopGroupProvider,
-              workflowModel,
-              workflowLevelOptions,
-              aiProfile,
-              workflowPreset,
-              artifactsDir,
-              stateDir,
-              logDir,
-              baseBranch,
-              docsDir,
-              ctx.nodeOutputs,
-              config,
-              issueContext,
-              stepNamePrefix,
-              execContext,
-              ctx.runChildWorkflow
+              NO_NODE_RETRIES,
+              deadlineSignal =>
+                executeLoopGroupNode(
+                  deps,
+                  platform,
+                  conversationId,
+                  cwd,
+                  workflowRun,
+                  node,
+                  loopGroupProvider,
+                  workflowModel,
+                  workflowLevelOptions,
+                  aiProfile,
+                  workflowPreset,
+                  artifactsDir,
+                  stateDir,
+                  logDir,
+                  baseBranch,
+                  docsDir,
+                  ctx.nodeOutputs,
+                  config,
+                  issueContext,
+                  stepNamePrefix,
+                  execContext,
+                  ctx.runChildWorkflow,
+                  // Same reasoning as the loop node above: the group's `until_bash`
+                  // is a subprocess this run owns.
+                  combineAbortSignals(deadlineSignal, runSubprocessSignal)
+                ),
+              initialOutput,
+              {
+                store: deps.store,
+                nodeKey: stepNamePrefix + node.id,
+                clock: deps.clock,
+                parentDeadlineSignal,
+                deadlineOutput,
+              }
             );
             return { nodeId: node.id, output };
           }
@@ -7096,7 +7868,8 @@ async function runLayers(ctx: RunLayersContext): Promise<void> {
                   stepNamePrefix,
                   iteration,
                   ctx.bodyLoopUserInput ?? '',
-                  execContext
+                  execContext,
+                  combineAbortSignals(ctx.parentDeadlineSignal, runSubprocessSignal)
                 )
             );
             return { nodeId: node.id, output };
@@ -7109,7 +7882,35 @@ async function runLayers(ctx: RunLayersContext): Promise<void> {
           // node_completed is written inline by executeWorkflowNode itself (see
           // asCompleted — only on true completion, never on the paused branch).
           if (isWorkflowNode(node)) {
-            const output = await executeWorkflowNode(node, ctx);
+            const deadlineOutput: NodeExecutionResult = {
+              state: 'failed',
+              output: '',
+              error: NODE_DEADLINE_EXCEEDED,
+            };
+            const initialOutput: NodeExecutionResult = {
+              state: 'failed',
+              output: '',
+              error: 'Node did not execute',
+            };
+            const deadlineCleanup =
+              node.timeout !== undefined ? createWorkflowNodeDeadlineCleanup(node, ctx) : undefined;
+            const output = await runNodeRetryLoop(
+              node,
+              platform,
+              conversationId,
+              workflowRun,
+              NO_NODE_RETRIES,
+              deadlineSignal => executeWorkflowNode(node, ctx, deadlineSignal, deadlineCleanup),
+              initialOutput,
+              {
+                store: deps.store,
+                nodeKey: stepNamePrefix + node.id,
+                clock: deps.clock,
+                parentDeadlineSignal,
+                deadlineOutput,
+                onDeadlineExceeded: deadlineCleanup?.onDeadlineExceeded,
+              }
+            );
             return { nodeId: node.id, output };
           }
 
@@ -7236,13 +8037,23 @@ async function runLayers(ctx: RunLayersContext): Promise<void> {
           // 6. Execute with retry for transient failures. AI nodes get the
           // default 2 transient retries; the shared loop applies the same
           // backoff + FATAL-never-retried semantics as deterministic nodes.
+          const deadlineOutput: NodeExecutionResult = {
+            state: 'failed',
+            output: '',
+            error: NODE_DEADLINE_EXCEEDED,
+          };
+          const initialOutput: NodeExecutionResult = {
+            state: 'failed',
+            output: '',
+            error: 'Node did not execute',
+          };
           const output = await runNodeRetryLoop(
             node,
             platform,
             conversationId,
             workflowRun,
             getEffectiveNodeRetryConfig(node),
-            () =>
+            deadlineSignal =>
               executeNodeInternal(
                 deps,
                 platform,
@@ -7268,9 +8079,17 @@ async function runLayers(ctx: RunLayersContext): Promise<void> {
                 resolvedTier,
                 resolvedEffort,
                 stepNamePrefix,
-                iteration
+                iteration,
+                deadlineSignal
               ),
-            { state: 'failed', output: '', error: 'Node did not execute' } as NodeExecutionResult
+            initialOutput,
+            {
+              store: deps.store,
+              nodeKey: stepNamePrefix + node.id,
+              clock: deps.clock,
+              parentDeadlineSignal,
+              deadlineOutput,
+            }
           );
 
           // Cold-resume surfacing: this node requested a session resume but the
