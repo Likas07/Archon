@@ -3867,6 +3867,16 @@ async function executeLoopGroupNode(
       parentDeadlineSignal: governanceDeadlineSignal,
     };
     await runLayers(iterCtx);
+    // Fold this iteration's usage BEFORE the deadline check. The iteration ran and
+    // was billed; returning above the accumulation below would under-report spend
+    // on exactly the path a governance feature exists to account for.
+    loopTotalCostUsd = (loopTotalCostUsd ?? 0) + iterCtx.totalCostUsd;
+    if (iterCtx.totalTokensIn > 0 || iterCtx.totalTokensOut > 0) {
+      loopTotalTokens = {
+        input: (loopTotalTokens?.input ?? 0) + iterCtx.totalTokensIn,
+        output: (loopTotalTokens?.output ?? 0) + iterCtx.totalTokensOut,
+      };
+    }
     if (isDeadlineExceededSignal(governanceDeadlineSignal)) {
       return {
         state: 'failed',
@@ -3891,14 +3901,6 @@ async function executeLoopGroupNode(
         'loop_group_node.post_body_stop'
       );
       return { state: 'failed', output: lastIterationOutput, error: `Workflow ${effectiveStatus}` };
-    }
-    // Accumulate usage across iterations (charged on the failure path below too).
-    loopTotalCostUsd = (loopTotalCostUsd ?? 0) + iterCtx.totalCostUsd;
-    if (iterCtx.totalTokensIn > 0 || iterCtx.totalTokensOut > 0) {
-      loopTotalTokens = {
-        input: (loopTotalTokens?.input ?? 0) + iterCtx.totalTokensIn,
-        output: (loopTotalTokens?.output ?? 0) + iterCtx.totalTokensOut,
-      };
     }
 
     // A failed body node fails the group immediately — mirrors the top-level DAG
@@ -4610,14 +4612,15 @@ async function executeLoopNode(
 
   for (let i = startIteration; i <= loop.max_iterations; i++) {
     if (isDeadlineExceededSignal(governanceDeadlineSignal)) {
-      return {
-        state: 'failed',
+      // Route through failLoopNode like every other terminal exit. The node has
+      // already emitted node_started, so returning directly would end its audit
+      // trail mid-flight with no node_failed row.
+      return failLoopNode(NODE_DEADLINE_EXCEEDED, {
         output: lastIterationOutput,
-        error: NODE_DEADLINE_EXCEEDED,
-        costUsd: loopTotalCostUsd,
+        ...(loopTotalCostUsd !== undefined ? { costUsd: loopTotalCostUsd } : {}),
         ...(loopTotalTokens !== undefined ? { tokens: loopTotalTokens } : {}),
         loopIterations: i - 1,
-      };
+      });
     }
     const iterationStart = Date.now();
 
@@ -5043,14 +5046,12 @@ async function executeLoopNode(
       foldIterationUsage();
 
       if (isDeadlineExceededSignal(governanceDeadlineSignal)) {
-        return {
-          state: 'failed',
+        return await failLoopNode(NODE_DEADLINE_EXCEEDED, {
           output: cleanOutput,
-          error: NODE_DEADLINE_EXCEEDED,
-          costUsd: loopTotalCostUsd,
+          ...(loopTotalCostUsd !== undefined ? { costUsd: loopTotalCostUsd } : {}),
           ...(loopTotalTokens !== undefined ? { tokens: loopTotalTokens } : {}),
           loopIterations: i,
-        };
+        });
       }
 
       // Stream ended with background tasks still live (idle timeout mid-wait or
