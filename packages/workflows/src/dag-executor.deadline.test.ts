@@ -641,6 +641,74 @@ describe('absolute node deadline schedules', () => {
     );
   });
 
+  test('own-deadline expiry beats an attempt that rejects from the abort it caused', async () => {
+    // The `until_bash` deadline path: the clock arm fires, aborts `runSignal`,
+    // the subprocess dies, and the catch throws NODE_DEADLINE_EXCEEDED -- so
+    // `run()` REJECTS on the very path that also produced a `deadline` outcome.
+    // Both arms of the race settle from one cause, and which one `Promise.race`
+    // adopts decides whether the node is recorded as timed out or as a bare
+    // error: only the `deadline` arm reaches emitNodeDeadlineExceeded, which is
+    // what writes `expiry_reason` and the `state: 'timed_out'` event.
+    //
+    // The ordering is not incidental. The clock arm ALREADY has its outcome
+    // value when it calls `.abort()`; the rejection can only be scheduled by
+    // that abort, so it is at best one microtask behind and `Promise.race`
+    // is settled by then. This holds whether the attempt rejects synchronously
+    // inside its abort listener or a macrotask later (a real subprocess death).
+    // Both are asserted here so a future refactor that moves the abort earlier,
+    // or awaits between it and the return, fails rather than silently
+    // downgrading every until_bash timeout to an unattributed error.
+    for (const rejectMode of ['sync', 'macrotask'] as const) {
+      const clock = new FakeWorkflowClock(0);
+      const deadlineStore = createDeadlineStore();
+      const rejectOnAbort = (signal?: AbortSignal): Promise<NodeOutput> =>
+        new Promise((_resolve, reject) => {
+          signal?.addEventListener('abort', () => {
+            const fail = (): void => {
+              reject(new Error(NODE_DEADLINE_EXCEEDED));
+            };
+            if (rejectMode === 'sync') fail();
+            else setTimeout(fail, 0);
+          });
+        });
+
+      const pending = runNodeRetryLoop(
+        loopNode(100),
+        platform,
+        'conversation',
+        workflowRun,
+        noRetries,
+        rejectOnAbort,
+        initialOutput,
+        {
+          store: deadlineStore.store,
+          nodeKey: 'loop',
+          clock,
+          deadlineOutput,
+        }
+      );
+      // Let the loop's async pre-flight (deadline persistence, expiry check)
+      // finish and ARM the race before the clock moves. Advancing synchronously
+      // here instead makes `clock.now() >= deadlineAt` true at the pre-flight
+      // check, so the node short-circuits before `run()` is ever called -- the
+      // race this test exists to pin is never entered, and the assertions below
+      // pass against the wrong code path.
+      await Promise.resolve();
+      await Promise.resolve();
+      expect(clock.pendingWaitCount()).toBe(1);
+      clock.advanceBy(100);
+
+      expect(await pending).toEqual(deadlineOutput);
+      expect(deadlineStore.expireWorkflowNodeDeadline).toHaveBeenCalledWith(
+        expect.objectContaining({ expiry_reason: NODE_DEADLINE_EXCEEDED })
+      );
+      expect(deadlineStore.createWorkflowEvent).toHaveBeenCalledWith(
+        expect.objectContaining({ data: expect.objectContaining({ state: 'timed_out' }) })
+      );
+      expect(clock.pendingWaitCount()).toBe(0);
+    }
+  });
+
   test('cancels the deadline wait when the attempt throws instead of returning', async () => {
     // executeLoopNode and executeLoopGroupNode THROW NODE_DEADLINE_EXCEEDED out
     // of their until_bash paths rather than returning a failed output, so the
